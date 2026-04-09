@@ -1,0 +1,1874 @@
+depression_detection_system/
+│
+├── backend/                  ← FastAPI backend root
+│   ├── app/                  ← Your Python source code
+│   │   ├── main.py
+│   │   ├── config.py
+│   │   ├── routes/
+│   │   ├── voicebot/
+		llm.py
+		depression_nlp.py
+		stt.py
+		tts.py
+│   │   └── videobot/
+		emotion_detector.py
+		video_capture.py
+	routes/
+		video_routes.py
+		voice_routes.py
+	utils/
+│   │
+│   ├── models/               ← ✅ Moved inside backend/
+│   │   └── face_model.h5     ← Pretrained emotion detection model
+│   │
+│   └── requirements.txt      ← ✅ This is here
+│
+├── venv/                     ← Python virtual environment (local dev only)
+├── .env                      ← Stores GROQ_API_KEY and other secrets
+├── Dockerfile                ← You're trying to build this now
+└── README.md
+config.py 
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+import logging
+import sys
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("depression_detection.log", mode='a')
+    ]
+)
+logger = logging.getLogger("DepressionDetection")
+# Load .env file from project root
+project_root = Path(__file__).parent.parent.parent  # Points to depression_detection_system/
+dotenv_path = project_root / ".env"
+if dotenv_path.exists():
+    load_dotenv(dotenv_path)
+    logger.info(f"Loaded .env from {dotenv_path}")
+else:
+    logger.warning(f".env file not found at {dotenv_path}")
+    # Don't raise error immediately, check if env vars are set elsewhere
+# Now read environment variables
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "meta-llama/llama-4-scout-17b-16e-instruct")
+# Validate required keys with better error handling
+if not GROQ_API_KEY:
+    logger.error("GROQ_API_KEY not set in environment variables")
+    logger.error("Please set GROQ_API_KEY in your .env file or environment variables")
+    # Don't raise error here, let individual components handle it
+else:
+    logger.info("GROQ_API_KEY found")
+# Paths
+MODELS_DIR = project_root / "backend" / "models"
+FACE_MODEL_PATH = MODELS_DIR / "face_model.h5"
+# Validate model file
+if FACE_MODEL_PATH.exists():
+    logger.info(f"Face model found at {FACE_MODEL_PATH}")
+else:
+    logger.warning(f"Face model not found at {FACE_MODEL_PATH}")
+# Supported Languages
+SUPPORTED_LANGUAGES = {
+    'en': 'English',
+    'es': 'Spanish',
+    'fr': 'French',
+    'de': 'German',
+    'hi': 'Hindi'
+}
+# Emotions from face_model.h5
+EMOTIONS = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
+# Audio processing settings
+AUDIO_SETTINGS = {
+    "sample_rate": 16000,
+    "channels": 1,
+    "chunk_size": 1024,
+    "format": "wav",
+    "max_duration": 300,  # 5 minutes max
+    "min_duration": 0.5   # 0.5 seconds min
+}
+# Video processing settings
+VIDEO_SETTINGS = {
+    "max_duration": 1800,  # 30 minutes
+    "analysis_interval": 2,  # seconds
+    "frame_width": 640,
+    "frame_height": 480
+}
+# Depression analysis settings
+DEPRESSION_ANALYSIS = {
+    "voice_weight": 0.7,
+    "video_weight": 0.3,
+    "confidence_threshold": 0.6,
+    "depression_keywords": [
+        "sad", "depressed", "hopeless", "worthless", "tired", 
+        "empty", "lonely", "anxious", "worried", "stressed"
+    ]
+}
+# Check dependencies
+def check_dependencies():
+    """Check if required dependencies are available"""
+    missing_deps = []
+    try:
+        import whisper
+        logger.info("Whisper available")
+    except ImportError:
+        missing_deps.append("openai-whisper")
+        logger.error("Whisper not available")
+    try:
+        import cv2
+        logger.info("OpenCV available")
+    except ImportError:
+        missing_deps.append("opencv-python")
+        logger.error("OpenCV not available")
+    try:
+        import tensorflow
+        logger.info("TensorFlow available")
+    except ImportError:
+        missing_deps.append("tensorflow")
+        logger.error("TensorFlow not available")
+    try:
+        import pydub
+        logger.info("Pydub available")
+    except ImportError:
+        missing_deps.append("pydub")
+        logger.error("Pydub not available")
+    try:
+        import gtts
+        logger.info("gTTS available")
+    except ImportError:
+        missing_deps.append("gtts")
+        logger.error("gTTS not available")
+    try:
+        import groq
+        if GROQ_API_KEY:
+            logger.info("Groq client available with API key")
+        else:
+            logger.warning("Groq client available but no API key")
+    except ImportError:
+        missing_deps.append("groq")
+        logger.error("Groq client not available")
+    if missing_deps:
+        logger.error(f"Missing dependencies: {', '.join(missing_deps)}")
+        logger.error("Install missing dependencies with: pip install " + " ".join(missing_deps))
+        return False, missing_deps
+    else:
+        logger.info("All dependencies available")
+        return True, []
+# Check system requirements
+def check_system_requirements():
+    """Check system requirements and configurations"""
+    issues = []
+    # Check disk space for temporary files
+    import shutil
+    free_space = shutil.disk_usage(".")[2] / (1024**3)  # GB
+    if free_space < 1:
+        issues.append(f"Low disk space: {free_space:.2f}GB available")
+    # Check if ffmpeg is available (for pydub)
+    try:
+        from pydub.utils import which
+        if not which("ffmpeg"):
+            issues.append("FFmpeg not found - audio conversion may fail")
+    except:
+        pass
+    if issues:
+        for issue in issues:
+            logger.warning(f"{issue}")
+    return len(issues) == 0, issues
+# Initialize checks
+deps_ok, missing_deps = check_dependencies()
+system_ok, system_issues = check_system_requirements()
+if not deps_ok:
+    logger.error("System not ready - missing dependencies")
+if not system_ok:
+    logger.warning("System has configuration issues")
+logger.info("Configuration loaded successfully")
+depression_nlp.py
+from .stt import STT
+from .tts import TTS
+from .llm import LLMProcessor
+import logging
+logger = logging.getLogger(__name__)
+class VoiceBot:
+    def __init__(self):
+        self.stt = STT()
+        self.tts = TTS()
+        self.llm = LLMProcessor()
+        self.confidence = 0.5
+        logger.info("VoiceBot initialized successfully")
+    def process_audio_for_depression(self, audio_path):
+        try:
+            transcription, error = self.stt.transcribe(audio_path)
+            if not transcription:
+                return {
+                    "analysis_type": "error",
+                    "is_depressed": False,
+                    "confidence": 0.5,
+                    "response": "Audio could not be understood.",
+                    "audio_response": b""
+                }
+            result = self.llm.analyze_depression(transcription)
+            audio_response = self.tts.text_to_speech(result["response"])
+            return {
+                "analysis_type": result.get("analysis_type", "unknown"),
+                "is_depressed": result["is_depressed"],
+                "confidence": result["confidence"],
+                "response": result["response"],
+                "audio_response": audio_response,
+                "needs_professional_help": result.get("needs_professional_help", False)
+            }
+        except Exception as e:
+            return {
+                "analysis_type": "error",
+                "is_depressed": False,
+                "confidence": 0.5,
+                "response": "Error analyzing your message.",
+                "audio_response": b"",
+                "needs_professional_help": False
+            }
+llm.py 
+from groq import Groq
+from config import GROQ_API_KEY, GROQ_MODEL_NAME
+import logging
+import ast
+import json
+import re
+from typing import Dict, Any
+logger = logging.getLogger(__name__)
+class LLMProcessor:
+    def __init__(self):
+        self.client = Groq(api_key=GROQ_API_KEY)
+        self.conversation_history = []
+        self.depression_keywords = {
+            'hopelessness': 0.8,
+            'worthless': 0.85,
+            'suicide': 0.95,
+            'depressed': 0.75,
+            'lonely': 0.7,
+            'sad': 0.65,
+            'empty': 0.7,
+            'guilt': 0.75,
+            'tired': 0.6,
+            'sleep': 0.65,
+            'appetite': 0.6,
+            'concentration': 0.65
+        }
+        self.positive_keywords = {
+            'happy': -0.7,
+            'joy': -0.75,
+            'excited': -0.65,
+            'good': -0.5,
+            'better': -0.6,
+            'improve': -0.55
+        }
+    def _extract_json(self, text: str) -> Dict[str, Any]:
+        """Extract JSON from LLM response, handling various formats."""
+        try:
+            # Try to find JSON within markdown code blocks
+            match = re.search(r'```(?:json)?\n(.*?)\n```', text, re.DOTALL)
+            if match:
+                text = match.group(1)
+            # Try direct JSON parsing first
+            return json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                # Fallback to literal_eval for non-standard JSON
+                return ast.literal_eval(text)
+            except (ValueError, SyntaxError):
+                logger.error("Could not extract JSON from response")
+                return None
+    def _calculate_lexical_confidence(self, text: str) -> float:
+        """Calculate initial confidence score based on keyword analysis."""
+        text_lower = text.lower()
+        score = 0.0
+        keyword_count = 0
+        # Check for depression keywords
+        for keyword, weight in self.depression_keywords.items():
+            if keyword in text_lower:
+                score += weight
+                keyword_count += 1
+        # Check for positive keywords that might mitigate depression signals
+        for keyword, weight in self.positive_keywords.items():
+            if keyword in text_lower:
+                score += weight
+                keyword_count += 1
+        # Normalize score (0-1 range)
+        if keyword_count > 0:
+            normalized_score = min(max(score / keyword_count, 0.0), 1.0)
+            return round(normalized_score, 2)
+        return 0.5  # Default neutral score if no keywords found
+    def analyze_depression(self, text: str) -> Dict[str, Any]:
+        try:
+            lexical_confidence = self._calculate_lexical_confidence(text)
+            history = "\n".join([f"User: {msg['input']}\nAI: {msg['output']}"
+                               for msg in self.conversation_history[-3:]])
+            prompt = f"""
+Perform a comprehensive depression analysis considering:
+1. Semantic content and emotional tone
+2. Severity indicators (mention of self-harm, extreme hopelessness)
+3. Duration indicators (long-term vs recent feelings)
+4. Impact on daily functioning
+Message: {text}
+First, analyze these aspects and determine:
+- Depression likelihood (0-1 scale)
+- Severity level (mild, moderate, severe)
+- Whether professional help is recommended
+Then generate a supportive response appropriate for the determined level.
+Respond with ONLY the following JSON structure:
+{{
+    "analysis_type": "depression"|"conflict"|"other",
+    "is_depressed": bool,
+    "confidence": float (0-1),
+    "severity": "mild"|"moderate"|"severe",
+    "response": str,
+    "reason": str,
+    "needs_professional_help": bool,
+    "keywords_found": list[str],
+    "lexical_confidence": float
+}}
+For depression analysis, consider:
+- Mild: Some symptoms but manageable daily life
+- Moderate: Several symptoms affecting daily functioning
+- Severe: Many symptoms with significant impairment or danger
+"""
+            logger.info(f"Sending prompt to LLM:\n{prompt}")
+            response = self.client.chat.completions.create(
+                model=GROQ_MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                timeout=10,
+                response_format={"type": "json_object"}
+            )
+            raw_response = response.choices[0].message.content.strip()
+            logger.info(f"Raw LLM output:\n{raw_response}")
+            result = self._extract_json(raw_response)
+            if not result or not isinstance(result, dict):
+                logger.error("Invalid response format from LLM")
+                result = {
+                    "analysis_type": "unknown",
+                    "is_depressed": False,
+                    "confidence": lexical_confidence,
+                    "severity": "mild",
+                    "response": "I'm having trouble understanding right now.",
+                    "reason": "LLM returned invalid format",
+                    "needs_professional_help": False,
+                    "keywords_found": [],
+                    "lexical_confidence": lexical_confidence
+                }
+            # Combine lexical and semantic confidence
+            if 'confidence' in result and isinstance(result['confidence'], (int, float)):
+                final_confidence = (lexical_confidence + result['confidence']) / 2
+                result['confidence'] = round(final_confidence, 2)
+                result['lexical_confidence'] = lexical_confidence
+            else:
+                result['confidence'] = lexical_confidence
+                result['lexical_confidence'] = lexical_confidence
+            # Validate and set default values for required fields
+            required_fields = {
+                "analysis_type": "unknown",
+                "is_depressed": False,
+                "severity": "mild",
+                "response": "Let's continue our conversation.",
+                "reason": "Incomplete response from AI",
+                "needs_professional_help": False,
+                "keywords_found": [],
+                "lexical_confidence": lexical_confidence
+            }
+            for field, default in required_fields.items():
+                if field not in result:
+                    result[field] = default
+            self.conversation_history.append({
+                "input": text,
+                "output": result["response"]
+            })
+            return result
+        except Exception as e:
+            logger.exception("LLM analysis failed")
+            return {
+                "analysis_type": "error",
+                "is_depressed": False,
+                "confidence": 0.5,
+                "severity": "mild",
+                "response": "Let's continue our conversation.",
+                "reason": "Error occurred",
+                "needs_professional_help": False,
+                "keywords_found": [],
+                "lexical_confidence": 0.5
+            }
+ stt.py
+import whisper
+import logging
+import os
+import wave
+import numpy as np
+import librosa
+import base64
+from pathlib import Path
+logger = logging.getLogger(__name__)
+class STT:
+    def __init__(self):
+        self.model = whisper.load_model("base")
+        logger.info("Initializing Speech-to-Text engine...")
+    def validate_audio_file(self, audio_path):
+        if not os.path.exists(audio_path):
+            return False, "Audio file does not exist"
+        file_size = os.path.getsize(audio_path)
+        if file_size == 0:
+            return False, "Audio file is empty"
+        try:
+            with wave.open(audio_path, 'rb') as wav_file:
+                params = wav_file.getparams()
+                duration = wav_file.getnframes() / wav_file.getframerate()
+                if duration < 0.5:
+                    return False, f"Audio too short: {duration:.2f}s"
+        except Exception as e:
+            return False, f"Invalid WAV file: {e}"
+        return True, ""
+    def transcribe(self, audio_path):
+        logger.info(f"Starting transcription for file: {audio_path}")
+        is_valid, msg = self.validate_audio_file(audio_path)
+        if not is_valid:
+            logger.warning(f"Validation failed: {msg}")
+            return "", msg
+        result = self.model.transcribe(
+            audio_path,
+            language="en",
+            task="transcribe",
+            fp16=False,
+            verbose=False
+        )
+        transcription = result["text"].strip()
+        if not transcription:
+            logger.warning("Whisper returned empty transcription")
+            return "", "No speech detected"
+        logger.info(f"Transcription successful: '{transcription}'")
+        return transcription, None
+tts.py 
+from gtts import gTTS
+import io
+from config import logger
+class TTS:
+    def text_to_speech(self, text, lang='en'):
+        try:
+            if not text.strip():
+                logger.warning(" Empty text provided to TTS")
+                return b""
+            logger.info(f" Converting text to speech: '{text[:20]}...'")
+            tts = gTTS(text=text, lang=lang)
+            audio_buffer = io.BytesIO()
+            tts.write_to_fp(audio_buffer)
+            audio_buffer.seek(0)
+            audio_data = audio_buffer.getvalue()
+            if len(audio_data) == 0:
+                logger.error(" Generated audio is empty")
+                return b""
+            logger.info("Audio generated successfully")
+            return audio_data
+        except Exception as e:
+            logger.exception(f" TTS Error: {e}")
+            return b""
+voice_routes.py
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi.logger import logger
+import tempfile
+import os
+import base64
+import json
+from app.voicebot.depression_nlp import VoiceBot
+router = APIRouter()
+voice_bot = VoiceBot()
+@router.websocket("/ws/conversation/{session_id}")
+async def websocket_conversation(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    logger.info(f"WebSocket connected for session: {session_id}")
+    while True:
+        try:
+            data = await websocket.receive_json()
+            logger.info(f"Received WebSocket message: {data.get('type')}")
+            if data.get("type") == "audio":
+                transcription = data.get("transcription", "")
+                logger.info(f"User said: '{transcription}'")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpfile:
+                    wav_path = tmpfile.name
+                decoded_audio = base64.b64decode(data.get("audio", ""))
+                if not decoded_audio:
+                    logger.warning("No audio data received")
+                    continue
+                with open(wav_path, "wb") as f:
+                    f.write(decoded_audio)
+                response = voice_bot.process_audio_for_depression(wav_path)
+                os.unlink(wav_path)
+                if response["audio_response"]:
+                    await websocket.send_json({
+                        "type": "ai_response",
+                        "analysis_type": response["analysis_type"],
+                        "text_response": response["response"],
+                        "audio_response": base64.b64encode(response["audio_response"]).decode(),
+                        "is_depressed": response["is_depressed"],
+                        "confidence_score": response["confidence"],
+                        "needs_professional_help": response["needs_professional_help"],
+                        "transcription": transcription
+                    })
+                else:
+                    await websocket.send_json({
+                        "type": "transcription_failed",
+                        "message": "Could not understand the audio. Please speak clearly and try again."
+                    })
+        except WebSocketDisconnect:
+            logger.info(f"WebSocket disconnected for session: {session_id}")
+            break
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}", exc_info=True)
+            await websocket.send_json({
+                "type": "error",
+                "message": "Internal server error"
+            })
+video_routes.py
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi.logger import logger
+import numpy as np
+from datetime import datetime
+from typing import Optional
+from app.videobot.video_capture import VideoCapture
+router = APIRouter()
+video_capture = VideoCapture()
+@router.websocket("/ws/video/{session_id}")
+async def video_websocket(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    logger.info(f"Video WebSocket connected for session: {session_id}")
+    try:
+        while True:
+            # Receive frame as bytes
+            data = await websocket.receive_bytes()
+            # Process frame
+            result = await video_capture.process_frame(data, session_id)
+            if "error" in result:
+                await websocket.send_json({"type": "error", "message": result["error"]})
+                continue
+            await websocket.send_json({
+                "type": "analysis",
+                "emotion": result["emotion"],
+                "score": result["score"],
+                "timestamp": result["timestamp"]
+            })
+    except WebSocketDisconnect:
+        logger.info(f"Video WebSocket disconnected for session: {session_id}")
+        video_capture.cleanup_session(session_id)
+    except Exception as e:
+        logger.error(f"Video WebSocket error: {str(e)}")
+        await websocket.send_json({"type": "error", "message": str(e)})
+        video_capture.cleanup_session(session_id)
+@router.get("/results/{session_id}")
+async def get_video_results(session_id: str):
+    """Get stored video analysis results"""
+    try:
+        results = video_capture.get_session_results(session_id)
+        if not results:
+            return {
+                "status": "error",
+                "message": "No results found for this session"
+            }
+        return {
+            "status": "success",
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Error retrieving video results: {str(e)}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+emotion_detector.py
+import cv2
+import numpy as np
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing import image
+from config import FACE_MODEL_PATH  # Add this import at the top
+class EmotionDetector:
+    def __init__(self):
+        self.model = load_model(FACE_MODEL_PATH)  # Use from config.py
+        self.class_names = ['Angry', 'Disgusted', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+    def detect_emotion(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+        if len(faces) == 0:
+            return "neutral"
+        (x, y, w, h) = faces[0]  # Process only the first face
+        face_roi = frame[y:y+h, x:x+w]
+        # Preprocess for model
+        face_img = cv2.resize(face_roi, (48, 48))
+        face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+        face_img = image.img_to_array(face_img)
+        face_img = np.expand_dims(face_img, axis=0)
+        predictions = self.model.predict(face_img)
+        return self.class_names[np.argmax(predictions)].lower()  # Match your existing emotion format
+video_capture.py
+import cv2
+import time
+import logging
+import threading
+import numpy as np
+from datetime import datetime
+from typing import Optional, Dict, Any
+from collections import defaultdict, Counter
+from .emotion_detector import EmotionDetector
+logger = logging.getLogger("DepressionDetection")
+class VideoCapture:
+    """Video analysis manager with WebSocket support for real-time emotion detection"""
+    # Emotion to depression score mapping
+    EMOTION_TO_DEPRESSION_SCORE = {
+        "happy": 0.1,
+        "neutral": 0.5,
+        "sad": 0.8,
+        "angry": 0.9,
+        "fear": 0.85,
+        "disgust": 0.8,
+        "surprise": 0.4
+    }
+    # Singleton pattern
+    _instance = None
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    def __init__(self):
+        if hasattr(self, '_initialized'):
+            return
+        self._initialized = True
+        self.emotion_detector = EmotionDetector()
+        self.active_sessions = {}
+        self.lock = threading.Lock()
+        logger.info("VideoCapture initialized with WebSocket support")
+    async def process_frame(self, frame_data: bytes, session_id: str) -> Dict[str, Any]:
+        """Process individual frames from WebSocket"""
+        try:
+            # Decode frame
+            nparr = np.frombuffer(frame_data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if frame is None:
+                logger.error("Failed to decode WebSocket frame")
+                return {"error": "Invalid frame data"}
+            # Detect emotion
+            emotion = self.emotion_detector.detect_emotion(frame)
+            score = self.EMOTION_TO_DEPRESSION_SCORE.get(emotion, 0.5)
+            # Update session data
+            with self.lock:
+                if session_id not in self.active_sessions:
+                    self.active_sessions[session_id] = {
+                        "start_time": datetime.utcnow(),
+                        "emotions": [],
+                        "last_frame_time": None
+                    }
+                self.active_sessions[session_id]["emotions"].append(emotion)
+                self.active_sessions[session_id]["last_frame_time"] = datetime.utcnow()
+            return {
+                "emotion": emotion,
+                "score": score,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        except Exception as e:
+            logger.exception("Frame processing failed")
+            return {"error": str(e)}
+    def get_session_results(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get results for a session"""
+        with self.lock:
+            session = self.active_sessions.get(session_id)
+            if not session:
+                return None
+            return self._generate_result(session_id, session["emotions"])
+    def cleanup_session(self, session_id: str) -> None:
+        """Clean up session resources"""
+        with self.lock:
+            if session_id in self.active_sessions:
+                del self.active_sessions[session_id]
+    def _generate_result(self, session_id: str, emotions: list) -> Dict[str, Any]:
+        """Generate analysis results from emotion list"""
+        total_samples = len(emotions)
+        result = {
+            "dominant_emotion": "neutral",
+            "score": 0.5,
+            "total_samples": total_samples,
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        if emotions:
+            counter = Counter(emotions)
+            result["dominant_emotion"] = counter.most_common(1)[0][0]
+            result["score"] = round(
+                self.EMOTION_TO_DEPRESSION_SCORE.get(
+                    result["dominant_emotion"], 0.5
+                ), 2
+            )
+        return result
+main.py
+import sys
+from pathlib import Path
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import datetime
+# Add the backend directory to Python path
+sys.path.append(str(Path(__file__).parent.parent))
+# Now import your routes
+from app.routes import voice_routes, video_routes
+app = FastAPI(
+    title="Depression Detection API",
+    description="Voice and video analysis for depression detection",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# Include routers
+app.include_router(
+    voice_routes.router,
+    prefix="/api/voice",
+    tags=["Voice Analysis"]
+)
+app.include_router(
+    video_routes.router,
+    prefix="/api/video",
+    tags=["Video Analysis"]
+)
+@app.get("/", include_in_schema=False)
+async def root():
+    return {
+        "message": "Depression Detection System API",
+        "endpoints": {
+            "documentation": ["/docs", "/redoc"],
+            "voice": "/api/voice",
+            "video": "/api/video"
+        }
+    }
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+app.js
+import React, { useState, useRef, useEffect } from 'react';
+import './App.css';
+function App() {
+  // Combined state management
+  const [activeModules, setActiveModules] = useState({
+    video: false,
+    audio: false
+  });
+  const [combinedScore, setCombinedScore] = useState(null);
+  // Video analysis state
+  const [videoState, setVideoState] = useState({
+    isAnalyzing: false,
+    sessionId: '',
+    emotionData: [],
+    dominantEmotion: null,
+    averageScore: 0,
+    error: null,
+    isLoading: false
+  });
+  // Audio analysis state
+  const [audioState, setAudioState] = useState({
+    isRecording: false,
+    conversation: [],
+    sessionId: '',
+    isLoading: false,
+    summary: null,
+    error: null
+  });
+  // Refs for both modules
+  const videoRefs = {
+    ws: useRef(null),
+    videoRef: useRef(null),
+    streamRef: useRef(null),
+    canvasRef: useRef(null),
+    frameInterval: useRef(null)
+  };
+  const audioRefs = {
+    ws: useRef(null),
+    mediaRecorder: useRef(null),
+    audioContext: useRef(null)
+  };
+  // Helper functions for video module
+  const initializeVideoSession = () => {
+    try {
+      const newSessionId = `video-session-${Date.now()}`;
+      setVideoState(prev => ({
+        ...prev,
+        sessionId: newSessionId,
+        error: null,
+        isLoading: true
+      }));
+      videoRefs.ws.current = new WebSocket(
+        `ws://${window.location.hostname}:8000/api/video/ws/video/${newSessionId}`
+      );
+      videoRefs.ws.current.onopen = () => {
+        setVideoState(prev => ({
+          ...prev,
+          isLoading: false
+        }));
+      };
+      videoRefs.ws.current.onerror = (err) => {
+        setVideoState(prev => ({
+          ...prev,
+          error: 'Failed to connect to video analysis server',
+          isLoading: false
+        }));
+        console.error('Video WebSocket error:', err);
+      };
+      videoRefs.ws.current.onclose = () => {
+        console.log('Video WebSocket disconnected');
+      };
+      videoRefs.ws.current.onmessage = handleVideoWebSocketMessage;
+    } catch (err) {
+      setVideoState(prev => ({
+        ...prev,
+        error: 'Failed to initialize video session',
+        isLoading: false
+      }));
+      console.error('Video initialization error:', err);
+    }
+  };
+  const handleVideoWebSocketMessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (!data || !data.type) return;
+      switch (data.type) {
+        case 'analysis':
+          updateVideoEmotionData(data);
+          break;
+        case 'error':
+          setVideoState(prev => ({
+            ...prev,
+            error: data.message || 'Video server error occurred'
+          }));
+          break;
+        default:
+          console.warn('Unknown video message type:', data.type);
+      }
+    } catch (err) {
+      console.error('Error processing video message:', err);
+    }
+  };
+  const updateVideoEmotionData = (data) => {
+    setVideoState(prev => {
+      const newData = [...prev.emotionData, {
+        emotion: data.emotion,
+        score: data.score,
+        timestamp: data.timestamp
+      }];
+      // Calculate dominant emotion
+      const emotionCounts = {};
+      let totalScore = 0;
+      newData.forEach(item => {
+        emotionCounts[item.emotion] = (emotionCounts[item.emotion] || 0) + 1;
+        totalScore += item.score;
+      });
+      const dominantEmotion = Object.keys(emotionCounts).reduce((a, b) => 
+        emotionCounts[a] > emotionCounts[b] ? a : b
+      );
+      const averageScore = totalScore / newData.length;
+      return {
+        ...prev,
+        emotionData: newData,
+        dominantEmotion,
+        averageScore
+      };
+    });
+  };
+  const startVideoAnalysis = async () => {
+    if (videoState.isAnalyzing || !videoRefs.videoRef.current) return;
+    setVideoState(prev => ({
+      ...prev,
+      error: null,
+      isLoading: true
+    }));
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: {
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          facingMode: 'user'
+        },
+        audio: false
+      });
+      videoRefs.streamRef.current = stream;
+      if (videoRefs.videoRef.current) {
+        videoRefs.videoRef.current.srcObject = stream;
+      }
+      videoRefs.frameInterval.current = setInterval(() => {
+        captureVideoFrame();
+      }, 1000);
+      setVideoState(prev => ({
+        ...prev,
+        isAnalyzing: true,
+        isLoading: false
+      }));
+    } catch (err) {
+      setVideoState(prev => ({
+        ...prev,
+        error: err.message.includes('permission') ? 
+          'Camera access was denied. Please enable camera permissions.' : 
+          'Failed to access camera. Please check your device.',
+        isAnalyzing: false,
+        isLoading: false
+      }));
+      console.error('Camera access error:', err);
+    }
+  };
+  const stopVideoAnalysis = () => {
+    if (!videoState.isAnalyzing) return;
+    cleanupVideoResources();
+    setVideoState(prev => ({
+      ...prev,
+      isAnalyzing: false
+    }));
+  };
+  const cleanupVideoResources = () => {
+    if (videoRefs.frameInterval.current) {
+      clearInterval(videoRefs.frameInterval.current);
+      videoRefs.frameInterval.current = null;
+    }
+    if (videoRefs.streamRef.current) {
+      videoRefs.streamRef.current.getTracks().forEach(track => track.stop());
+      videoRefs.streamRef.current = null;
+    }
+    if (videoRefs.videoRef.current && videoRefs.videoRef.current.srcObject) {
+      videoRefs.videoRef.current.srcObject = null;
+    }
+    if (videoRefs.ws.current && videoRefs.ws.current.readyState === WebSocket.OPEN) {
+      videoRefs.ws.current.close();
+    }
+  };
+  const captureVideoFrame = () => {
+    try {
+      if (!videoRefs.videoRef.current || 
+          !videoRefs.canvasRef.current || 
+          !videoRefs.videoRef.current.videoWidth || 
+          !videoRefs.videoRef.current.videoHeight) {
+        return;
+      }
+      const video = videoRefs.videoRef.current;
+      const canvas = videoRefs.canvasRef.current;
+      if (video.readyState !== 4) return;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(blob => {
+        if (!blob || !videoRefs.ws.current || videoRefs.ws.current.readyState !== WebSocket.OPEN) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const base64Data = reader.result.split(',')[1];
+            const binaryString = atob(base64Data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            videoRefs.ws.current.send(bytes.buffer);
+          } catch (err) {
+            console.error('Error sending video frame:', err);
+          }
+        };
+        reader.readAsDataURL(blob);
+      }, 'image/jpeg', 0.8);
+    } catch (err) {
+      console.error('Video frame capture error:', err);
+    }
+  };
+  // Helper functions for audio module
+  const getWavBytes = (buffer, options) => {
+    const numFrames = buffer.length;
+    const numChannels = options.numChannels || 1;
+    const sampleRate = options.sampleRate || 16000;
+    const bytesPerSample = options.isFloat ? 4 : 2;
+    const format = options.isFloat ? 3 : 1;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = numFrames * blockAlign;
+    const bufferSize = 44 + dataSize;
+    const buf = new ArrayBuffer(bufferSize);
+    const view = new DataView(buf);
+    const writeString = (view, offset, string) => {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    };
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(view, 8, 'WAVE');
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, format, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bytesPerSample * 8, true);
+    writeString(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
+    const volume = 1;
+    let offset = 44;
+    for (let i = 0; i < buffer.length; i++) {
+      view.setInt16(offset, buffer[i] * (0x7FFF * volume), true);
+      offset += 2;
+    }
+    return buf;
+  };
+  const playAudioResponse = (base64Audio) => {
+    const audio = new Audio(`data:audio/wav;base64,${base64Audio}`);
+    audio.play();
+  };
+  const initializeAudioSession = () => {
+    const newSessionId = 'audio-session-' + Date.now();
+    setAudioState(prev => ({
+      ...prev,
+      sessionId: newSessionId
+    }));
+    audioRefs.audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+    audioRefs.ws.current = new WebSocket(
+      `ws://${window.location.hostname}:8000/api/voice/ws/conversation/${newSessionId}`
+    );
+    audioRefs.ws.current.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === 'ai_response') {
+        setAudioState(prev => ({
+          ...prev,
+          isLoading: false,
+          conversation: [
+            ...prev.conversation,
+            { 
+              speaker: 'bot', 
+              text: data.text_response || "No response generated",
+              confidence: data.confidence_score,
+              isDepressed: data.is_depressed
+            }
+          ]
+        }));
+        if (data.audio_response) {
+          playAudioResponse(data.audio_response);
+        }
+      }
+    };
+    audioRefs.ws.current.onerror = (err) => {
+      setAudioState(prev => ({
+        ...prev,
+        error: 'Failed to connect to audio analysis server'
+      }));
+      console.error('Audio WebSocket error:', err);
+    };
+  };
+  const startAudioRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true
+        }
+      });
+      setAudioState(prev => ({
+        ...prev,
+        isRecording: true
+      }));
+      audioRefs.mediaRecorder.current = new MediaRecorder(stream, {
+        mimeType: 'audio/webm',
+        audioBitsPerSecond: 128000
+      });
+      const audioChunks = [];
+      audioRefs.mediaRecorder.current.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          audioChunks.push(e.data);
+        }
+      };
+      audioRefs.mediaRecorder.current.onstop = async () => {
+        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        await processAudio(audioBlob);
+        stream.getTracks().forEach(track => track.stop());
+      };
+      audioRefs.mediaRecorder.current.start(500);
+    } catch (err) {
+      console.error('Audio recording error:', err);
+      setAudioState(prev => ({
+        ...prev,
+        isRecording: false,
+        error: err.message.includes('permission') ? 
+          'Microphone access was denied. Please enable microphone permissions.' : 
+          'Failed to access microphone. Please check your device.'
+      }));
+    }
+  };
+  const stopAudioRecording = () => {
+    if (audioRefs.mediaRecorder.current && audioState.isRecording) {
+      audioRefs.mediaRecorder.current.stop();
+      setAudioState(prev => ({
+        ...prev,
+        isRecording: false,
+        isLoading: true
+      }));
+    }
+  };
+  const processAudio = async (audioBlob) => {
+    try {
+      const wavBlob = await convertToWav(audioBlob);
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64Audio = reader.result.split(',')[1];
+        audioRefs.ws.current.send(JSON.stringify({
+          type: "audio",
+          audio: base64Audio,
+          transcription: ""
+        }));
+      };
+      reader.readAsDataURL(wavBlob);
+    } catch (err) {
+      console.error('Audio processing error:', err);
+      setAudioState(prev => ({
+        ...prev,
+        isLoading: false,
+        error: 'Failed to process audio'
+      }));
+    }
+  };
+  const convertToWav = async (blob) => {
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioBuffer = await audioRefs.audioContext.current.decodeAudioData(arrayBuffer);
+    const offlineCtx = new OfflineAudioContext(
+      1, 
+      16000 * audioBuffer.duration, 
+      16000
+    );
+    const source = offlineCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(offlineCtx.destination);
+    source.start();
+    const resampledBuffer = await offlineCtx.startRendering();
+    const wavBytes = getWavBytes(resampledBuffer.getChannelData(0), {
+      isFloat: false,
+      numChannels: 1,
+      sampleRate: 16000,
+    });
+    return new Blob([wavBytes], { type: 'audio/wav' });
+  };
+  const calculateAudioSummary = () => {
+    const botMessages = audioState.conversation.filter(msg => msg.speaker === 'bot');
+    if (botMessages.length === 0) {
+      setAudioState(prev => ({
+        ...prev,
+        summary: {
+          averageConfidence: 0,
+          totalMessages: 0,
+          depressedCount: 0
+        }
+      }));
+      return;
+    }
+    const totalConfidence = botMessages.reduce((sum, msg) => sum + (msg.confidence || 0), 0);
+    const depressedCount = botMessages.filter(msg => msg.isDepressed).length;
+    setAudioState(prev => ({
+      ...prev,
+      summary: {
+        averageConfidence: totalConfidence / botMessages.length,
+        totalMessages: botMessages.length,
+        depressedCount
+      }
+    }));
+  };
+  // Updated combined score calculation with exact behavior requested
+  const calculateCombinedScore = () => {
+    let videoScore = null;
+    let audioScore = null;
+    // Video score: directly use averageScore as depression likelihood
+    if (activeModules.video && videoState.emotionData.length > 0) {
+      videoScore = videoState.averageScore;
+    }
+    // Audio score: use averageConfidence as depression likelihood
+    if (activeModules.audio && audioState.summary?.totalMessages > 0) {
+      audioScore = audioState.summary.averageConfidence;
+    }
+    // Return combined score based on what's active
+    if (videoScore !== null && audioScore !== null) {
+      // Both active: 50/50 weighted average
+      return (videoScore + audioScore) / 2;
+    } else if (videoScore !== null) {
+      // Video only
+      return videoScore;
+    } else if (audioScore !== null) {
+      // Audio only
+      return audioScore;
+    } else {
+      // Neither active or no data
+      return null;
+    }
+  };
+  // Update combined score whenever relevant data changes
+  useEffect(() => {
+    const newScore = calculateCombinedScore();
+    setCombinedScore(newScore);
+  }, [videoState.averageScore, audioState.summary, activeModules]);
+  // Module toggle handlers
+  const toggleVideoModule = () => {
+    const newState = !activeModules.video;
+    setActiveModules(prev => ({
+      ...prev,
+      video: newState
+    }));
+    if (newState) {
+      initializeVideoSession();
+    } else {
+      if (videoState.isAnalyzing) {
+        stopVideoAnalysis();
+      }
+      cleanupVideoResources();
+      setVideoState(prev => ({
+        ...prev,
+        emotionData: [],
+        dominantEmotion: null,
+        averageScore: 0
+      }));
+    }
+  };
+  const toggleAudioModule = () => {
+    const newState = !activeModules.audio;
+    setActiveModules(prev => ({
+      ...prev,
+      audio: newState
+    }));
+    if (newState) {
+      initializeAudioSession();
+    } else {
+      if (audioState.isRecording) {
+        stopAudioRecording();
+      }
+      if (audioRefs.ws.current && audioRefs.ws.current.readyState === WebSocket.OPEN) {
+        audioRefs.ws.current.close();
+      }
+      if (audioRefs.audioContext.current.state !== 'closed') {
+        audioRefs.audioContext.current.close();
+      }
+      setAudioState(prev => ({
+        ...prev,
+        conversation: [],
+        summary: null
+      }));
+    }
+  };
+  // Emotion color mapping
+  const getEmotionColor = (emotion) => {
+    const colors = {
+      happy: '#4CAF50',
+      neutral: '#9E9E9E',
+      sad: '#2196F3',
+      angry: '#F44336',
+      fear: '#673AB7',
+      disgust: '#795548',
+      surprise: '#FFC107'
+    };
+    return colors[emotion] || '#000000';
+  };
+  // Initialize modules based on active state
+  useEffect(() => {
+    if (activeModules.video) {
+      initializeVideoSession();
+    }
+    if (activeModules.audio) {
+      initializeAudioSession();
+    }
+    return () => {
+      cleanupVideoResources();
+      if (audioRefs.ws.current && audioRefs.ws.current.readyState === WebSocket.OPEN) {
+        audioRefs.ws.current.close();
+      }
+      if (audioRefs.audioContext.current && audioRefs.audioContext.current.state !== 'closed') {
+        audioRefs.audioContext.current.close();
+      }
+    };
+  }, []);
+  return (
+    <div className="app-container">
+      <h1>Multimodal Emotion Analysis Dashboard</h1>
+      {/* Module selection */}
+      <div className="module-selector">
+        <div className="module-toggle">
+          <label>
+            <input 
+              type="checkbox" 
+              checked={activeModules.video} 
+              onChange={toggleVideoModule} 
+            />
+            Video Analysis
+          </label>
+        </div>
+        <div className="module-toggle">
+          <label>
+            <input 
+              type="checkbox" 
+              checked={activeModules.audio} 
+              onChange={toggleAudioModule} 
+            />
+            Audio Conversation
+          </label>
+        </div>
+      </div>
+      {/* Error displays */}
+      {videoState.error && (
+        <div className="error-message video-error">
+          <strong>Video Error:</strong> {videoState.error}
+          <button onClick={() => setVideoState(prev => ({ ...prev, error: null }))} className="dismiss-button">
+            ×
+          </button>
+        </div>
+      )}
+      {audioState.error && (
+        <div className="error-message audio-error">
+          <strong>Audio Error:</strong> {audioState.error}
+          <button onClick={() => setAudioState(prev => ({ ...prev, error: null }))} className="dismiss-button">
+            ×
+          </button>
+        </div>
+      )}
+      {/* Loading indicators */}
+      {(videoState.isLoading || audioState.isLoading) && (
+        <div className="loading-overlay">
+          <div className="spinner"></div>
+          <p>Processing...</p>
+        </div>
+      )}
+      {/* Main content */}
+      <div className="dashboard-content">
+        {/* Video module */}
+        {activeModules.video && (
+          <div className="module-container video-module">
+            <h2>Video Emotion Analysis</h2>
+            <div className="video-container">
+              <video 
+                ref={videoRefs.videoRef}
+                autoPlay
+                playsInline
+                muted
+                style={{ display: videoState.isAnalyzing ? 'block' : 'none' }}
+              />
+              {!videoState.isAnalyzing && (
+                <div className="video-placeholder">
+                  {videoState.isLoading ? 'Initializing...' : 'Camera will appear here when analysis starts'}
+                </div>
+              )}
+            </div>
+            <canvas ref={videoRefs.canvasRef} style={{ display: 'none' }} />
+            <div className="controls">
+              <button
+                onClick={videoState.isAnalyzing ? stopVideoAnalysis : startVideoAnalysis}
+                className={`control-button ${videoState.isAnalyzing ? 'stop-button' : 'start-button'}`}
+                disabled={videoState.isLoading || !activeModules.video}
+              >
+                {videoState.isAnalyzing ? 'Stop Analysis' : 'Start Analysis'}
+              </button>
+            </div>
+            <div className="analysis-results">
+              <h3>Real-time Video Analysis</h3>
+              {videoState.emotionData.length > 0 ? (
+                <>
+                  <div className="summary">
+                    <p><strong>Dominant Emotion:</strong> 
+                      <span style={{ color: getEmotionColor(videoState.dominantEmotion) }}>
+                        {videoState.dominantEmotion}
+                      </span>
+                    </p>
+                    <p><strong>Average Score:</strong> {videoState.averageScore.toFixed(2)}</p>
+                    <p><strong>Frames Analyzed:</strong> {videoState.emotionData.length}</p>
+                  </div>
+                  <div className="emotion-chart-container">
+                    <div className="emotion-chart">
+                      {videoState.emotionData.slice().reverse().map((item, index) => (
+                        <div 
+                          key={index} 
+                          className="emotion-bar" 
+                          style={{
+                            height: `${item.score * 100}%`,
+                            backgroundColor: getEmotionColor(item.emotion)
+                          }}
+                        >
+                          <span className="emotion-label">{item.emotion}</span>
+                          <span className="emotion-score">{item.score.toFixed(2)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <p className="no-data-message">
+                  No video analysis data yet. Start the video analysis to see results.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+        {/* Audio module */}
+        {activeModules.audio && (
+          <div className="module-container audio-module">
+            <h2>Audio Conversation Analysis</h2>
+            <div className="status">
+              {audioState.isRecording ? (
+                <div className="recording-indicator">
+                  <div className="pulse-circle"></div>
+                  Recording...
+                </div>
+              ) : (
+                <div>Ready to record</div>
+              )}
+            </div>
+            <div className="controls">
+              <button 
+                onClick={audioState.isRecording ? stopAudioRecording : startAudioRecording}
+                className={`control-button ${audioState.isRecording ? 'stop-button' : 'start-button'}`}
+                disabled={audioState.isLoading || !activeModules.audio}
+              >
+                {audioState.isRecording ? 'Stop Recording' : 'Start Recording'}
+              </button>
+              <button 
+                onClick={calculateAudioSummary}
+                className="control-button results-button"
+                disabled={audioState.conversation.length === 0 || audioState.isLoading}
+              >
+                Get Audio Summary
+              </button>
+            </div>
+            {audioState.summary && (
+              <div className="summary-box">
+                <h3>Conversation Summary</h3>
+                <p><strong>Total Messages:</strong> {audioState.summary.totalMessages}</p>
+                <p><strong>Average Confidence:</strong> {(audioState.summary.averageConfidence * 100).toFixed(1)}%</p>
+                <p><strong>Depression Detections:</strong> {audioState.summary.depressedCount}</p>
+              </div>
+            )}
+            <div className="conversation-log">
+              {audioState.conversation.map((msg, i) => (
+                <div key={i} className={`message ${msg.speaker}`}>
+                  <div className="message-header">
+                    <strong>{msg.speaker === 'user' ? 'You' : 'Therapist'}</strong>
+                    {msg.confidence !== undefined && (
+                      <span className="confidence-score">
+                        Confidence: {(msg.confidence * 100).toFixed(0)}%
+                      </span>
+                    )}
+                  </div>
+                  <div className="message-content">
+                    {msg.text || <em>No text response</em>}
+                  </div>
+                </div>
+              ))}
+              {audioState.isLoading && <div className="message bot">Processing...</div>}
+            </div>
+          </div>
+        )}
+      </div>
+      {/* Combined score display */}
+      {combinedScore !== null && (
+        <div className="combined-score-display">
+          <h3>Depression Likelihood Score</h3>
+          <div className="score-bar">
+            <div 
+              className="score-fill" 
+              style={{ width: `${combinedScore * 100}%` }}
+            >
+              {(combinedScore * 100).toFixed(1)}%
+            </div>
+          </div>
+          <p className="score-description">
+            {combinedScore < 0.3 ? 'Low likelihood of depression' :
+             combinedScore < 0.6 ? 'Moderate likelihood of depression' :
+             'High likelihood of depression'}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+export default App;
+app.css 
+/* Base Styles */
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #f5f5f5;
+  color: #333;
+}
+.app-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+}
+h1, h2, h3 {
+  color: #2c3e50;
+}
+h1 {
+  text-align: center;
+  margin-bottom: 30px;
+  font-size: 2.2rem;
+}
+h2 {
+  font-size: 1.8rem;
+  margin-bottom: 20px;
+  border-bottom: 2px solid #eee;
+  padding-bottom: 10px;
+}
+h3 {
+  font-size: 1.4rem;
+  margin-bottom: 15px;
+}
+/* Module Selector */
+.module-selector {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 30px;
+  background: white;
+  padding: 15px;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+.module-toggle {
+  display: flex;
+  align-items: center;
+}
+.module-toggle label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 500;
+}
+.module-toggle input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+/* Error Messages */
+.error-message {
+  padding: 15px;
+  margin-bottom: 20px;
+  border-radius: 5px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.video-error {
+  background-color: #ffebee;
+  border: 1px solid #ef9a9a;
+  color: #c62828;
+}
+.audio-error {
+  background-color: #fff3e0;
+  border: 1px solid #ffcc80;
+  color: #e65100;
+}
+.dismiss-button {
+  background: none;
+  border: none;
+  font-size: 1.5rem;
+  cursor: pointer;
+  padding: 0 5px;
+}
+/* Loading Overlay */
+.loading-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0,0,0,0.5);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.spinner {
+  width: 50px;
+  height: 50px;
+  border: 5px solid #f3f3f3;
+  border-top: 5px solid #3498db;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+.loading-overlay p {
+  color: white;
+  margin-top: 15px;
+  font-size: 1.2rem;
+}
+/* Dashboard Content */
+.dashboard-content {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 20px;
+}
+@media (min-width: 992px) {
+  .dashboard-content {
+    grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+  }
+}
+/* Module Containers */
+.module-container {
+  background: white;
+  border-radius: 8px;
+  padding: 20px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+/* Video Module */
+.video-container {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4/3;
+  background-color: #000;
+  border-radius: 5px;
+  overflow: hidden;
+  margin-bottom: 15px;
+}
+.video-container video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.video-placeholder {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  background-color: rgba(0,0,0,0.5);
+}
+/* Controls */
+.controls {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+.control-button {
+  padding: 10px 15px;
+  border: none;
+  border-radius: 5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  flex: 1;
+}
+.start-button {
+  background-color: #4CAF50;
+  color: white;
+}
+.start-button:hover {
+  background-color: #3e8e41;
+}
+.stop-button {
+  background-color: #f44336;
+  color: white;
+}
+.stop-button:hover {
+  background-color: #d32f2f;
+}
+.results-button {
+  background-color: #673AB7;
+  color: white;
+}
+.results-button:hover {
+  background-color: #5e35b1;
+}
+.control-button:disabled {
+  background-color: #cccccc;
+  cursor: not-allowed;
+}
+/* Analysis Results */
+.analysis-results {
+  margin-top: 20px;
+}
+.summary {
+  background-color: #f9f9f9;
+  padding: 15px;
+  border-radius: 5px;
+  margin-bottom: 20px;
+}
+.summary p {
+  margin: 8px 0;
+}
+/* Emotion Chart */
+.emotion-chart-container {
+  width: 100%;
+  overflow-x: auto;
+  padding-bottom: 10px;
+}
+.emotion-chart {
+  display: flex;
+  gap: 10px;
+  height: 200px;
+  align-items: flex-end;
+  min-width: min-content;
+  padding: 0 10px;
+}
+.emotion-bar {
+  width: 50px;
+  min-width: 50px;
+  position: relative;
+  transition: height 0.3s ease;
+  border-radius: 5px 5px 0 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  color: white;
+  text-shadow: 1px 1px 1px rgba(0,0,0,0.5);
+}
+.emotion-label {
+  font-size: 12px;
+  margin-bottom: 5px;
+  text-align: center;
+  word-break: break-word;
+}
+.emotion-score {
+  font-size: 10px;
+  margin-bottom: 5px;
+}
+.no-data-message {
+  text-align: center;
+  color: #777;
+  padding: 20px;
+  background-color: #f9f9f9;
+  border-radius: 5px;
+}
+/* Audio Module */
+.status {
+  text-align: center;
+  margin-bottom: 15px;
+  padding: 10px;
+  background-color: #f9f9f9;
+  border-radius: 5px;
+}
+.recording-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #f44336;
+  font-weight: 500;
+}
+.pulse-circle {
+  width: 12px;
+  height: 12px;
+  background-color: #f44336;
+  border-radius: 50%;
+  animation: pulse 1.5s infinite;
+}
+@keyframes pulse {
+  0% { transform: scale(0.95); opacity: 1; }
+  50% { transform: scale(1.1); opacity: 0.8; }
+  100% { transform: scale(0.95); opacity: 1; }
+}
+.summary-box {
+  background-color: #f0f7ff;
+  padding: 15px;
+  border-radius: 5px;
+  margin-bottom: 20px;
+}
+.summary-box p {
+  margin: 8px 0;
+}
+/* Conversation Log */
+.conversation-log {
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid #eee;
+  border-radius: 5px;
+  padding: 10px;
+}
+.message {
+  margin-bottom: 15px;
+  padding: 10px;
+  border-radius: 5px;
+  position: relative;
+}
+.message.user {
+  background-color: #e3f2fd;
+  margin-left: 20px;
+}
+.message.bot {
+  background-color: #f5f5f5;
+  margin-right: 20px;
+}
+.message-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 5px;
+  font-size: 0.9rem;
+}
+.confidence-score {
+  font-size: 0.8rem;
+  color: #666;
+}
+.message-content {
+  line-height: 1.4;
+}
+/* Combined Score Display */
+.combined-score-display {
+  margin-top: 30px;
+  background-color: white;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  text-align: center;
+}
+.score-bar {
+  width: 100%;
+  height: 30px;
+  background-color: #eee;
+  border-radius: 15px;
+  margin: 15px 0;
+  overflow: hidden;
+}
+.score-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4CAF50, #FFC107, #F44336);
+  transition: width 0.5s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-weight: bold;
+  font-size: 0.9rem;
+}
+.score-description {
+  font-size: 1.1rem;
+  margin-top: 10px;
+  font-weight: 500;
+}
+/* Responsive Adjustments */
+@media (max-width: 768px) {
+  .module-selector {
+    flex-direction: column;
+    gap: 10px;
+  }
+  .dashboard-content {
+    grid-template-columns: 1fr;
+  }
+  .controls {
+    flex-direction: column;
+  }
+}
