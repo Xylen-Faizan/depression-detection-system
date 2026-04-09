@@ -11,7 +11,7 @@ A multimodal depression detection system using voice and video analysis.
 
 ### 1. Clone the repo
 ```bash
-git clone https://github.com/YOUR_USERNAME/depression-detection-system.git
+git clone https://github.com/Xylen-Faizan/depression-detection-system.git
 cd depression_detection_system
 ```
 
@@ -31,6 +31,7 @@ pip install -r requirements.txt
 Create a `.env` file in the root folder:
 ```
 GROQ_API_KEY=your_groq_api_key_here
+OPENCAGE_API_KEY=your_opencage_api_key_here
 ```
 
 ### 4. Add the face model
