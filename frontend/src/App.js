@@ -1,637 +1,494 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import './App.css';
+import {
+  LiveKitRoom,
+  RoomAudioRenderer,
+  useConnectionState,
+  useMaybeRoomContext
+} from '@livekit/components-react';
+import '@livekit/components-styles';
+import { ConnectionState, RoomEvent } from 'livekit-client';
 
 function App() {
-  // Combined state management
-  const [activeModules, setActiveModules] = useState({
-    video: false,
-    audio: false
-  });
+  const [activeModules, setActiveModules] = useState({ video: true, audio: true });
   const [combinedScore, setCombinedScore] = useState(null);
 
   // Video analysis state
   const [videoState, setVideoState] = useState({
-    isAnalyzing: false,
-    sessionId: '',
-    emotionData: [],
-    dominantEmotion: null,
-    averageScore: 0,
-    error: null,
-    isLoading: false
+    isAnalyzing: false, sessionId: '', emotionData: [], dominantEmotion: null, averageScore: 0, error: null, isLoading: false
   });
 
-  // Audio analysis state
-  const [audioState, setAudioState] = useState({
-    isRecording: false,
-    conversation: [],
-    sessionId: '',
-    isLoading: false,
-    summary: null,
-    error: null,
-    latitude: null,
-    longitude: null
-  });
+  const videoRefs = { ws: useRef(null), videoRef: useRef(null), streamRef: useRef(null), canvasRef: useRef(null), frameInterval: useRef(null) };
 
-  // Refs for both modules
-  const videoRefs = {
-    ws: useRef(null),
-    videoRef: useRef(null),
-    streamRef: useRef(null),
-    canvasRef: useRef(null),
-    frameInterval: useRef(null)
-  };
-  const audioRefs = {
-    ws: useRef(null),
-    mediaRecorder: useRef(null),
-    audioContext: useRef(null)
-  };
-
-  // Helper functions for video module
   const initializeVideoSession = () => {
     try {
       const newSessionId = `video-session-${Date.now()}`;
-      setVideoState(prev => ({
-        ...prev,
-        sessionId: newSessionId,
-        error: null,
-        isLoading: true
-      }));
-      videoRefs.ws.current = new WebSocket(
-        `ws://${window.location.hostname}:8000/api/video/ws/video/${newSessionId}`
-      );
-      videoRefs.ws.current.onopen = () => {
-        setVideoState(prev => ({ ...prev, isLoading: false }));
-      };
+      setVideoState(prev => ({ ...prev, sessionId: newSessionId, error: null, isLoading: true }));
+      videoRefs.ws.current = new WebSocket(`ws://${window.location.hostname}:8000/api/video/ws/video/${newSessionId}`);
+      videoRefs.ws.current.onopen = () => setVideoState(prev => ({ ...prev, isLoading: false }));
       videoRefs.ws.current.onerror = (err) => {
-        setVideoState(prev => ({
-          ...prev,
-          error: 'Failed to connect to video analysis server',
-          isLoading: false
-        }));
-        console.error('Video WebSocket error:', err);
-      };
-      videoRefs.ws.current.onclose = () => {
-        console.log('Video WebSocket disconnected');
+        setVideoState(prev => ({ ...prev, error: 'Failed to connect to video server', isLoading: false }));
       };
       videoRefs.ws.current.onmessage = handleVideoWebSocketMessage;
     } catch (err) {
-      setVideoState(prev => ({
-        ...prev,
-        error: 'Failed to initialize video session',
-        isLoading: false
-      }));
-      console.error('Video initialization error:', err);
+      setVideoState(prev => ({ ...prev, error: 'Failed to initialize video', isLoading: false }));
     }
   };
 
   const handleVideoWebSocketMessage = (event) => {
     try {
       const data = JSON.parse(event.data);
-      if (!data || !data.type) return;
-      switch (data.type) {
-        case 'analysis':
-          updateVideoEmotionData(data);
-          break;
-        case 'error':
-          setVideoState(prev => ({
-            ...prev,
-            error: data.message || 'Video server error occurred'
-          }));
-          break;
-        default:
-          console.warn('Unknown video message type:', data.type);
-      }
-    } catch (err) {
-      console.error('Error processing video message:', err);
-    }
+      if (data.type === 'analysis') updateVideoEmotionData(data);
+    } catch (err) { }
   };
 
   const updateVideoEmotionData = (data) => {
     setVideoState(prev => {
-      const newData = [...prev.emotionData, {
-        emotion: data.emotion,
-        score: data.score,
-        timestamp: data.timestamp
-      }];
-      const emotionCounts = {};
-      let totalScore = 0;
+      const newData = [...prev.emotionData, { emotion: data.emotion, score: data.score, timestamp: data.timestamp }];
+      const emotionCounts = {}; let totalScore = 0;
       newData.forEach(item => {
         emotionCounts[item.emotion] = (emotionCounts[item.emotion] || 0) + 1;
         totalScore += item.score;
       });
-      const dominantEmotion = Object.keys(emotionCounts).reduce((a, b) =>
-        emotionCounts[a] > emotionCounts[b] ? a : b
-      );
-      const averageScore = totalScore / newData.length;
-      return { ...prev, emotionData: newData, dominantEmotion, averageScore };
+      const dominantEmotion = Object.keys(emotionCounts).reduce((a, b) => emotionCounts[a] > emotionCounts[b] ? a : b);
+      return { ...prev, emotionData: newData, dominantEmotion, averageScore: totalScore / newData.length };
     });
   };
 
   const startVideoAnalysis = async () => {
-    if (videoState.isAnalyzing || !videoRefs.videoRef.current) return;
+    if (videoState.isAnalyzing) return;
     setVideoState(prev => ({ ...prev, error: null, isLoading: true }));
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-        audio: false
-      });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { ideal: 640, height: 480, facingMode: 'user' }, audio: false });
       videoRefs.streamRef.current = stream;
-      if (videoRefs.videoRef.current) {
-        videoRefs.videoRef.current.srcObject = stream;
+      if (videoRefs.videoRef.current) videoRefs.videoRef.current.srcObject = stream;
+
+      if (!videoRefs.ws.current || videoRefs.ws.current.readyState !== WebSocket.OPEN) {
+        initializeVideoSession();
       }
-      videoRefs.frameInterval.current = setInterval(() => {
-        captureVideoFrame();
-      }, 1000);
+
+      videoRefs.frameInterval.current = setInterval(() => captureVideoFrame(), 1000);
       setVideoState(prev => ({ ...prev, isAnalyzing: true, isLoading: false }));
     } catch (err) {
-      setVideoState(prev => ({
-        ...prev,
-        error: err.message.includes('permission') ?
-          'Camera access was denied. Please enable camera permissions.' :
-          'Failed to access camera. Please check your device.',
-        isAnalyzing: false,
-        isLoading: false
-      }));
-      console.error('Camera access error:', err);
+      setVideoState(prev => ({ ...prev, error: 'Camera access denied', isAnalyzing: false, isLoading: false }));
     }
   };
 
   const stopVideoAnalysis = () => {
-    if (!videoState.isAnalyzing) return;
-    cleanupVideoResources();
+    if (videoRefs.frameInterval.current) clearInterval(videoRefs.frameInterval.current);
+    if (videoRefs.streamRef.current) videoRefs.streamRef.current.getTracks().forEach(track => track.stop());
+    if (videoRefs.videoRef.current) videoRefs.videoRef.current.srcObject = null;
     setVideoState(prev => ({ ...prev, isAnalyzing: false }));
-  };
-
-  const cleanupVideoResources = () => {
-    if (videoRefs.frameInterval.current) {
-      clearInterval(videoRefs.frameInterval.current);
-      videoRefs.frameInterval.current = null;
-    }
-    if (videoRefs.streamRef.current) {
-      videoRefs.streamRef.current.getTracks().forEach(track => track.stop());
-      videoRefs.streamRef.current = null;
-    }
-    if (videoRefs.videoRef.current && videoRefs.videoRef.current.srcObject) {
-      videoRefs.videoRef.current.srcObject = null;
-    }
-    if (videoRefs.ws.current && videoRefs.ws.current.readyState === WebSocket.OPEN) {
-      videoRefs.ws.current.close();
-    }
   };
 
   const captureVideoFrame = () => {
     try {
-      if (!videoRefs.videoRef.current ||
-          !videoRefs.canvasRef.current ||
-          !videoRefs.videoRef.current.videoWidth ||
-          !videoRefs.videoRef.current.videoHeight) return;
-
-      const video = videoRefs.videoRef.current;
-      const canvas = videoRefs.canvasRef.current;
-      if (video.readyState !== 4) return;
-
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
+      const video = videoRefs.videoRef.current; const canvas = videoRefs.canvasRef.current;
+      if (!video || !canvas || video.readyState !== 4) return;
+      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
       const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       canvas.toBlob(blob => {
         if (!blob || !videoRefs.ws.current || videoRefs.ws.current.readyState !== WebSocket.OPEN) return;
         const reader = new FileReader();
         reader.onload = () => {
-          try {
-            const base64Data = reader.result.split(',')[1];
-            const binaryString = atob(base64Data);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
-            }
-            videoRefs.ws.current.send(bytes.buffer);
-          } catch (err) {
-            console.error('Error sending video frame:', err);
-          }
+          const binaryString = atob(reader.result.split(',')[1]);
+          const bytes = new Uint8Array(binaryString.length);
+          for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+          videoRefs.ws.current.send(bytes.buffer);
         };
         reader.readAsDataURL(blob);
       }, 'image/jpeg', 0.8);
-    } catch (err) {
-      console.error('Video frame capture error:', err);
-    }
-  };
-
-  // Helper functions for audio module
-  const getWavBytes = (buffer, options) => {
-    const numFrames = buffer.length;
-    const numChannels = options.numChannels || 1;
-    const sampleRate = options.sampleRate || 16000;
-    const bytesPerSample = options.isFloat ? 4 : 2;
-    const format = options.isFloat ? 3 : 1;
-    const blockAlign = numChannels * bytesPerSample;
-    const byteRate = sampleRate * blockAlign;
-    const dataSize = numFrames * blockAlign;
-    const bufferSize = 44 + dataSize;
-    const buf = new ArrayBuffer(bufferSize);
-    const view = new DataView(buf);
-    const writeString = (view, offset, string) => {
-      for (let i = 0; i < string.length; i++) {
-        view.setUint8(offset + i, string.charCodeAt(i));
-      }
-    };
-    writeString(view, 0, 'RIFF');
-    view.setUint32(4, 36 + dataSize, true);
-    writeString(view, 8, 'WAVE');
-    writeString(view, 12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, format, true);
-    view.setUint16(22, numChannels, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, byteRate, true);
-    view.setUint16(32, blockAlign, true);
-    view.setUint16(34, bytesPerSample * 8, true);
-    writeString(view, 36, 'data');
-    view.setUint32(40, dataSize, true);
-    const volume = 1;
-    let offset = 44;
-    for (let i = 0; i < buffer.length; i++) {
-      view.setInt16(offset, buffer[i] * (0x7FFF * volume), true);
-      offset += 2;
-    }
-    return buf;
-  };
-
-  const playAudioResponse = (base64Audio) => {
-    const audio = new Audio(`data:audio/wav;base64,${base64Audio}`);
-    audio.play();
-  };
-
-  const initializeAudioSession = () => {
-    if ("geolocation" in navigator) {
-      navigator.geolocation.getCurrentPosition(
-        (position) => setAudioState(prev => ({ ...prev, latitude: position.coords.latitude, longitude: position.coords.longitude })),
-        (error) => console.log("Location access denied or error:", error)
-      );
-    }
-    const newSessionId = 'audio-session-' + Date.now();
-    setAudioState(prev => ({ ...prev, sessionId: newSessionId }));
-    audioRefs.audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
-    audioRefs.ws.current = new WebSocket(
-      `ws://${window.location.hostname}:8000/api/voice/ws/conversation/${newSessionId}`
-    );
-    audioRefs.ws.current.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === 'ai_response') {
-        setAudioState(prev => ({
-          ...prev,
-          isLoading: false,
-          conversation: [
-            ...prev.conversation,
-            {
-              speaker: 'bot',
-              text: data.text_response || "No response generated",
-              confidence: data.confidence_score,
-              isDepressed: data.is_depressed,
-              helplines: data.helplines || []
-            }
-          ]
-        }));
-        if (data.audio_response) {
-          playAudioResponse(data.audio_response);
-        }
-      } else if (data.type === 'transcription_failed' || data.type === 'error') {
-        setAudioState(prev => ({
-          ...prev,
-          isLoading: false,
-          error: data.message || 'Error communicating with analysis server'
-        }));
-        console.error('Audio WebSocket message error:', data.message);
-      }
-    };
-    audioRefs.ws.current.onerror = (err) => {
-      setAudioState(prev => ({ ...prev, error: 'Failed to connect to audio analysis server' }));
-      console.error('Audio WebSocket error:', err);
-    };
-  };
-
-  const startAudioRecording = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
-      });
-      setAudioState(prev => ({ ...prev, isRecording: true }));
-      audioRefs.mediaRecorder.current = new MediaRecorder(stream, {
-        mimeType: 'audio/webm',
-        audioBitsPerSecond: 128000
-      });
-      const audioChunks = [];
-      audioRefs.mediaRecorder.current.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunks.push(e.data);
-      };
-      audioRefs.mediaRecorder.current.onstop = async () => {
-        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-        await processAudio(audioBlob);
-        stream.getTracks().forEach(track => track.stop());
-      };
-      audioRefs.mediaRecorder.current.start(500);
-    } catch (err) {
-      console.error('Audio recording error:', err);
-      setAudioState(prev => ({
-        ...prev,
-        isRecording: false,
-        error: err.message.includes('permission') ?
-          'Microphone access was denied. Please enable microphone permissions.' :
-          'Failed to access microphone. Please check your device.'
-      }));
-    }
-  };
-
-  const stopAudioRecording = () => {
-    if (audioRefs.mediaRecorder.current && audioState.isRecording) {
-      audioRefs.mediaRecorder.current.stop();
-      setAudioState(prev => ({ ...prev, isRecording: false, isLoading: true }));
-    }
-  };
-
-  const processAudio = async (audioBlob) => {
-    try {
-      const wavBlob = await convertToWav(audioBlob);
-      const reader = new FileReader();
-      reader.onload = () => {
-        const base64Audio = reader.result.split(',')[1];
-        audioRefs.ws.current.send(JSON.stringify({
-          type: "audio",
-          audio: base64Audio,
-          transcription: "",
-          latitude: audioState.latitude,
-          longitude: audioState.longitude
-        }));
-      };
-      reader.readAsDataURL(wavBlob);
-    } catch (err) {
-      console.error('Audio processing error:', err);
-      setAudioState(prev => ({ ...prev, isLoading: false, error: 'Failed to process audio' }));
-    }
-  };
-
-  const convertToWav = async (blob) => {
-    const arrayBuffer = await blob.arrayBuffer();
-    const audioBuffer = await audioRefs.audioContext.current.decodeAudioData(arrayBuffer);
-    const offlineCtx = new OfflineAudioContext(1, 16000 * audioBuffer.duration, 16000);
-    const source = offlineCtx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(offlineCtx.destination);
-    source.start();
-    const resampledBuffer = await offlineCtx.startRendering();
-    const wavBytes = getWavBytes(resampledBuffer.getChannelData(0), {
-      isFloat: false, numChannels: 1, sampleRate: 16000,
-    });
-    return new Blob([wavBytes], { type: 'audio/wav' });
-  };
-
-  const calculateAudioSummary = () => {
-    const botMessages = audioState.conversation.filter(msg => msg.speaker === 'bot');
-    if (botMessages.length === 0) {
-      setAudioState(prev => ({ ...prev, summary: { averageConfidence: 0, totalMessages: 0, depressedCount: 0 } }));
-      return;
-    }
-    const totalConfidence = botMessages.reduce((sum, msg) => sum + (msg.confidence || 0), 0);
-    const depressedCount = botMessages.filter(msg => msg.isDepressed).length;
-    setAudioState(prev => ({
-      ...prev,
-      summary: { averageConfidence: totalConfidence / botMessages.length, totalMessages: botMessages.length, depressedCount }
-    }));
+    } catch (err) { }
   };
 
   const calculateCombinedScore = () => {
-    let videoScore = null;
-    let audioScore = null;
-    if (activeModules.video && videoState.emotionData.length > 0) videoScore = videoState.averageScore;
-    if (activeModules.audio && audioState.summary?.totalMessages > 0) audioScore = audioState.summary.averageConfidence;
-    if (videoScore !== null && audioScore !== null) return (videoScore + audioScore) / 2;
-    else if (videoScore !== null) return videoScore;
-    else if (audioScore !== null) return audioScore;
-    else return null;
+    if (videoState.emotionData.length > 0) return videoState.averageScore;
+    return null;
   };
+
+  useEffect(() => { setCombinedScore(calculateCombinedScore()); }, [videoState.averageScore]);
 
   useEffect(() => {
-    const newScore = calculateCombinedScore();
-    setCombinedScore(newScore);
-  }, [videoState.averageScore, audioState.summary, activeModules]);
-
-  const toggleVideoModule = () => {
-    const newState = !activeModules.video;
-    setActiveModules(prev => ({ ...prev, video: newState }));
-    if (newState) {
-      initializeVideoSession();
-    } else {
-      if (videoState.isAnalyzing) stopVideoAnalysis();
-      cleanupVideoResources();
-      setVideoState(prev => ({ ...prev, emotionData: [], dominantEmotion: null, averageScore: 0 }));
-    }
-  };
-
-  const toggleAudioModule = () => {
-    const newState = !activeModules.audio;
-    setActiveModules(prev => ({ ...prev, audio: newState }));
-    if (newState) {
-      initializeAudioSession();
-    } else {
-      if (audioState.isRecording) stopAudioRecording();
-      if (audioRefs.ws.current && audioRefs.ws.current.readyState === WebSocket.OPEN) audioRefs.ws.current.close();
-      if (audioRefs.audioContext.current.state !== 'closed') audioRefs.audioContext.current.close();
-      setAudioState(prev => ({ ...prev, conversation: [], summary: null }));
-    }
-  };
+    return () => {
+      stopVideoAnalysis();
+    };
+  }, []);
 
   const getEmotionColor = (emotion) => {
     const colors = {
       happy: '#4CAF50', neutral: '#9E9E9E', sad: '#2196F3',
       angry: '#F44336', fear: '#673AB7', disgust: '#795548', surprise: '#FFC107'
     };
-    return colors[emotion] || '#000000';
+    return colors[emotion] || '#bce9ff';
   };
 
-  useEffect(() => {
-    return () => {
-      cleanupVideoResources();
-      if (audioRefs.ws.current && audioRefs.ws.current.readyState === WebSocket.OPEN) audioRefs.ws.current.close();
-      if (audioRefs.audioContext.current && audioRefs.audioContext.current.state !== 'closed') audioRefs.audioContext.current.close();
-    };
-  }, []);
+  // LiveKit Logic
+  const [lkToken, setLkToken] = useState("");
+  const [livekitUrl, setLivekitUrl] = useState("");
+
+  const connectToVoiceAgent = async () => {
+    try {
+      const response = await fetch(`http://${window.location.hostname}:8000/api/livekit/token`);
+      const data = await response.json();
+
+      if (data.error) {
+        alert("Backend Error: " + data.error);
+        return;
+      }
+
+      setLkToken(data.token);
+      setLivekitUrl(data.url);
+    } catch (err) {
+      console.error("Failed to connect to AI voice agent", err);
+    }
+  };
+
+  const disconnectVoiceAgent = () => {
+    setLkToken("");
+  };
 
   return (
-    <div className="app-container">
-      <h1>Multimodal Emotion Analysis Dashboard</h1>
-
-      <div className="module-selector">
-        <div className="module-toggle">
-          <label>
-            <input type="checkbox" checked={activeModules.video} onChange={toggleVideoModule} />
-            Video Analysis
-          </label>
+    <div className="overflow-x-hidden min-h-[100dvh] text-[#dae2fd] font-['Inter'] flex">
+      {/* Sidebar */}
+      <nav className="hidden md:flex fixed inset-y-0 left-0 z-50 flex-col p-6 w-64 border-r border-white/5 bg-[#060e20]">
+        <div className="mb-10 px-2 flex items-center gap-3">
+          <span className="material-symbols-outlined text-[#87d0f0]" style={{ fontSize: "28px" }}>clinical_notes</span>
+          <span className="text-xl font-bold tracking-tighter text-[#87d0f0]">Serene Care</span>
         </div>
-        <div className="module-toggle">
-          <label>
-            <input type="checkbox" checked={activeModules.audio} onChange={toggleAudioModule} />
-            Audio Conversation
-          </label>
+        <div className="flex flex-col gap-2 flex-grow">
+          <a className="flex items-center gap-4 px-4 py-3 text-[#87d0f0] bg-[#222a3d] rounded-xl font-semibold transition-all scale-98 hover:opacity-80" href="#">
+            <span className="material-symbols-outlined active-tab">dashboard</span><span>Dashboard</span>
+          </a>
         </div>
-      </div>
-
-      {videoState.error && (
-        <div className="error-message video-error">
-          <strong>Video Error:</strong> {videoState.error}
-          <button onClick={() => setVideoState(prev => ({ ...prev, error: null }))} className="dismiss-button">×</button>
-        </div>
-      )}
-
-      {audioState.error && (
-        <div className="error-message audio-error">
-          <strong>Audio Error:</strong> {audioState.error}
-          <button onClick={() => setAudioState(prev => ({ ...prev, error: null }))} className="dismiss-button">×</button>
-        </div>
-      )}
-
-      {(videoState.isLoading || audioState.isLoading) && (
-        <div className="loading-overlay">
-          <div className="spinner"></div>
-          <p>Processing...</p>
-        </div>
-      )}
-
-      <div className="dashboard-content">
-        {activeModules.video && (
-          <div className="module-container video-module">
-            <h2>Video Emotion Analysis</h2>
-            <div className="video-container">
-              <video ref={videoRefs.videoRef} autoPlay playsInline muted
-                style={{ display: videoState.isAnalyzing ? 'block' : 'none' }} />
-              {!videoState.isAnalyzing && (
-                <div className="video-placeholder">
-                  {videoState.isLoading ? 'Initializing...' : 'Camera will appear here when analysis starts'}
-                </div>
-              )}
+        <div className="mt-auto pt-6 border-t border-white/5">
+          <div className="bg-[#171f33] p-4 rounded-2xl">
+            <p className="text-xs text-[#bfc8cd] uppercase tracking-widest mb-2">System Status</p>
+            <div className="flex items-center gap-2">
+              <span className={`w-2 h-2 rounded-full ${videoState.isAnalyzing || !!lkToken ? 'bg-red-500 animate-pulse' : 'bg-[#87d0f0]'}`}></span>
+              <span className="text-sm font-medium">{videoState.isAnalyzing || !!lkToken ? "Neural Engine Active" : "Standby"}</span>
             </div>
-            <canvas ref={videoRefs.canvasRef} style={{ display: 'none' }} />
-            <div className="controls">
-              <button
-                onClick={videoState.isAnalyzing ? stopVideoAnalysis : startVideoAnalysis}
-                className={`control-button ${videoState.isAnalyzing ? 'stop-button' : 'start-button'}`}
-                disabled={videoState.isLoading || !activeModules.video}
-              >
-                {videoState.isAnalyzing ? 'Stop Analysis' : 'Start Analysis'}
-              </button>
+          </div>
+        </div>
+      </nav>
+
+      {/* Main Content Area */}
+      <main className="md:ml-64 p-6 md:p-8 flex-grow">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 max-w-7xl mx-auto">
+
+          {/* Top Info Bar */}
+          <header className="lg:col-span-12 flex justify-between items-center bg-[#0b1326]/60 backdrop-blur-3xl p-4 rounded-2xl shadow-lg border border-white/5">
+            <div>
+              <h1 className="text-2xl font-bold text-white">Diagnostic Dashboard</h1>
+              <p className="text-sm text-[#bfc8cd]">Multimodal Emotion Tracking & Intervention</p>
             </div>
-            <div className="analysis-results">
-              <h3>Real-time Video Analysis</h3>
-              {videoState.emotionData.length > 0 ? (
-                <>
-                  <div className="summary">
-                    <p><strong>Dominant Emotion:</strong>
-                      <span style={{ color: getEmotionColor(videoState.dominantEmotion) }}>
-                        {videoState.dominantEmotion}
-                      </span>
-                    </p>
-                    <p><strong>Average Score:</strong> {videoState.averageScore.toFixed(2)}</p>
-                    <p><strong>Frames Analyzed:</strong> {videoState.emotionData.length}</p>
+            {combinedScore !== null && (
+              <div className="text-right">
+                <p className="text-xs text-[#bfc8cd] uppercase tracking-wider">Depressive Traits Likelihood</p>
+                <div className="flex items-center justify-end gap-3 mt-1">
+                  <div className="w-32 h-2 bg-[#171f33] rounded-full overflow-hidden">
+                    <div className="h-full bg-[#87d0f0]" style={{ width: `${combinedScore * 100}%` }}></div>
                   </div>
-                  <div className="emotion-chart-container">
-                    <div className="emotion-chart">
-                      {videoState.emotionData.slice().reverse().map((item, index) => (
-                        <div key={index} className="emotion-bar"
-                          style={{ height: `${item.score * 100}%`, backgroundColor: getEmotionColor(item.emotion) }}>
-                          <span className="emotion-label">{item.emotion}</span>
-                          <span className="emotion-score">{item.score.toFixed(2)}</span>
-                        </div>
-                      ))}
+                  <span className="text-lg font-bold text-white">{(combinedScore * 100).toFixed(1)}%</span>
+                </div>
+              </div>
+            )}
+          </header>
+
+          {/* Left Column (Video & Graphs) */}
+          <div className="lg:col-span-7 flex flex-col gap-8">
+
+            <section className="relative overflow-hidden rounded-2xl bg-[#060e20] aspect-video border border-white/5 shadow-xl group">
+              <video ref={videoRefs.videoRef} autoPlay playsInline muted className="w-full h-full object-contain" style={{ display: videoState.isAnalyzing ? 'block' : 'none' }} />
+
+              {!videoState.isAnalyzing ? (
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#060e20]/90">
+                  <span className="material-symbols-outlined text-[48px] text-[#2d3449] mb-4">videocam_off</span>
+                  <p className="text-[#bfc8cd] mb-6 font-medium tracking-wide">Video stream offline</p>
+                  <button onClick={startVideoAnalysis} className="px-6 py-3 bg-gradient-to-r from-[#87d0f0] to-[#2d7d9a] text-[#003545] font-bold rounded-full shadow-[0_0_30px_-5px_rgba(135,208,240,0.4)] hover:scale-105 active:scale-95 transition-all">
+                    Initialize Camera
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="absolute top-4 left-4 flex gap-2">
+                    <div className="px-3 py-1.5 backdrop-blur-xl bg-[#222a3d]/50 rounded-full flex items-center gap-2 border border-white/10">
+                      <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                      <span className="text-[10px] font-bold tracking-tight text-white uppercase">Live Analysis</span>
+                    </div>
+                  </div>
+                  <button onClick={stopVideoAnalysis} className="absolute top-4 right-4 w-10 h-10 rounded-full bg-red-500/20 text-red-400 hover:bg-red-500/40 border border-red-500/50 flex items-center justify-center transition-colors">
+                    <span className="material-symbols-outlined">videocam_off</span>
+                  </button>
+                  <div className="absolute bottom-6 left-6 right-6">
+                    <div className="bg-[#0b1326]/70 backdrop-blur-xl p-4 rounded-xl border border-white/10 inline-block">
+                      <p className="text-[#bfc8cd] text-xs uppercase tracking-widest mb-1">Current State</p>
+                      <h3 className="text-2xl font-bold tracking-tight text-white capitalize">
+                        {videoState.dominantEmotion || "Analyzing..."}
+                        {videoState.emotionData.length > 0 && <span className="ml-2 text-[#87d0f0] font-normal text-lg">({(videoState.emotionData[videoState.emotionData.length - 1].score * 100).toFixed(0)}%)</span>}
+                      </h3>
                     </div>
                   </div>
                 </>
-              ) : (
-                <p className="no-data-message">No video analysis data yet. Start the video analysis to see results.</p>
               )}
+              <canvas ref={videoRefs.canvasRef} style={{ display: 'none' }} />
+            </section>
+
+            <section className="bg-[#222a3d] rounded-2xl p-6 border border-white/5 shadow-xl flex flex-col">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h2 className="text-xl font-semibold tracking-tight text-white">Emotion Telemetry</h2>
+                  <p className="text-xs text-[#bfc8cd]">Real-time affect mapping</p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-3 mb-4">
+                {['happy', 'sad', 'angry', 'fear', 'disgust', 'surprise', 'neutral'].map(emote => (
+                  <div key={emote} className="flex items-center gap-1.5 bg-[#0b1326]/50 px-2 py-1 rounded">
+                    <span className="w-2.5 h-2.5 rounded-full shadow-sm" style={{ backgroundColor: getEmotionColor(emote) }}></span>
+                    <span className="text-[10px] text-[#dae2fd] uppercase tracking-wider font-semibold">{emote}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="h-48 w-full flex items-end gap-[4px] relative overflow-x-auto group border-b border-white/10 pb-2">
+                {videoState.emotionData.length > 0 ? (
+                  videoState.emotionData.slice(-40).map((item, index) => (
+                    <div key={index} className="w-[30px] min-w-[30px] rounded-t flex flex-col justify-end items-center pb-1 transition-all"
+                      style={{ height: `${item.score * 100}%`, backgroundColor: getEmotionColor(item.emotion) }}
+                      title={`${item.emotion}: ${(item.score * 100).toFixed(1)}%`}>
+                      <span style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }} className="text-[9px] text-white font-bold opacity-80">{item.emotion}</span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="absolute inset-0 flex items-center justify-center text-[#3f484d] text-sm">
+                    Connect camera to view live telemetry
+                  </div>
+                )}
+              </div>
+            </section>
+          </div>
+
+          {/* Right Column (LiveKit Chat) */}
+          <div className="lg:col-span-5 relative">
+            <div className="bg-[#131b2e] rounded-2xl border border-white/5 flex flex-col h-[800px] shadow-2xl sticky top-6">
+
+              <div className="px-6 py-4 border-b border-white/5 bg-[#2d3449] flex items-center justify-between rounded-t-2xl">
+                <div className="flex items-center gap-4">
+                  <div className="w-10 h-10 rounded-full bg-[#2d7d9a] flex items-center justify-center shadow-lg">
+                    <span className="material-symbols-outlined text-[#fafdff]">psychiatry</span>
+                  </div>
+                  <div>
+                    <h3 className="font-semibold text-sm text-white">Serene Healthcare Assistant</h3>
+                    <p className="text-[10px] text-[#87d0f0] uppercase tracking-widest">LiveKit Voice Agent</p>
+                  </div>
+                </div>
+
+                <button onClick={!!lkToken ? disconnectVoiceAgent : connectToVoiceAgent}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider transition-all shadow-md
+                            ${!!lkToken ? 'bg-red-500/20 text-red-400 border border-red-500/50 hover:bg-red-500/30' : 'bg-[#31394d] text-[#dae2fd] border border-white/10 hover:bg-[#3f484d]'}`}>
+                  <span className="material-symbols-outlined text-[18px]">{!!lkToken ? 'stop_circle' : 'mic'}</span>
+                  {!!lkToken ? 'End Session' : 'Connect'}
+                </button>
+              </div>
+
+              <div className="flex-grow overflow-y-auto p-6 space-y-6 relative">
+                {!!lkToken ? (
+                  <LiveKitRoom
+                    token={lkToken}
+                    serverUrl={livekitUrl} // Dynamically provided by the backend from the .env config
+                    connect={true}
+                    audio={true}
+                    video={false}
+                    className="flex flex-col h-full"
+                  >
+                    <ActiveVoiceSession />
+                  </LiveKitRoom>
+                ) : (
+                  <div className="absolute inset-0 flex items-center justify-center flex-col text-center p-8">
+                    <span className="material-symbols-outlined text-[64px] text-[#2d3449] mb-4">record_voice_over</span>
+                    <p className="text-[#87d0f0] font-medium mb-2">Ready to Listen</p>
+                    <p className="text-[#3f484d] text-sm">Click connect to initiate a secure, real-time voice session with Serene.</p>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
-        )}
 
-        {activeModules.audio && (
-          <div className="module-container audio-module">
-            <h2>Audio Conversation Analysis</h2>
-            <div className="status">
-              {audioState.isRecording ? (
-                <div className="recording-indicator">
-                  <div className="pulse-circle"></div>
-                  Recording...
-                </div>
-              ) : (
-                <div>Ready to record</div>
-              )}
-            </div>
-            <div className="controls">
-              <button
-                onClick={audioState.isRecording ? stopAudioRecording : startAudioRecording}
-                className={`control-button ${audioState.isRecording ? 'stop-button' : 'start-button'}`}
-                disabled={audioState.isLoading || !activeModules.audio}
-              >
-                {audioState.isRecording ? 'Stop Recording' : 'Start Recording'}
-              </button>
-              <button onClick={calculateAudioSummary} className="control-button results-button"
-                disabled={audioState.conversation.length === 0 || audioState.isLoading}>
-                Get Audio Summary
-              </button>
-            </div>
-            {audioState.summary && (
-              <div className="summary-box">
-                <h3>Conversation Summary</h3>
-                <p><strong>Total Messages:</strong> {audioState.summary.totalMessages}</p>
-                <p><strong>Average Confidence:</strong> {(audioState.summary.averageConfidence * 100).toFixed(1)}%</p>
-                <p><strong>Depression Detections:</strong> {audioState.summary.depressedCount}</p>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+// Sub-component to handle the LiveKit room logic cleanly
+function ActiveVoiceSession() {
+  const connectionState = useConnectionState();
+  const room = useMaybeRoomContext();
+  const [transcripts, setTranscripts] = useState([]);
+  const chatEndRef = useRef(null);
+
+  const isConnected = connectionState === ConnectionState.Connected;
+
+  // Auto-scroll to bottom when new transcripts arrive
+  useEffect(() => {
+    if (chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [transcripts]);
+
+  // Listen for transcription events from the room
+  useEffect(() => {
+    if (!room || !isConnected) return;
+
+    const handleTranscription = (segments, participant) => {
+      if (!segments || segments.length === 0) return;
+
+      const isAgent = participant?.identity?.startsWith('agent') ||
+        participant?.identity?.includes('agent') ||
+        !participant?.identity?.startsWith('User');
+
+      segments.forEach(segment => {
+        if (!segment.text || segment.text.trim() === '') return;
+
+        if (segment.final) {
+          // Final segment - add or update the transcript
+          setTranscripts(prev => {
+            const existingIdx = prev.findIndex(t => t.segmentId === segment.id);
+            if (existingIdx >= 0) {
+              const updated = [...prev];
+              updated[existingIdx] = {
+                ...updated[existingIdx],
+                text: segment.text,
+                isFinal: true
+              };
+              return updated;
+            }
+            return [...prev, {
+              segmentId: segment.id,
+              text: segment.text,
+              isAgent,
+              isFinal: true,
+              timestamp: Date.now()
+            }];
+          });
+        } else {
+          // Interim segment - update or add
+          setTranscripts(prev => {
+            const existingIdx = prev.findIndex(t => t.segmentId === segment.id);
+            if (existingIdx >= 0) {
+              const updated = [...prev];
+              updated[existingIdx] = {
+                ...updated[existingIdx],
+                text: segment.text
+              };
+              return updated;
+            }
+            return [...prev, {
+              segmentId: segment.id,
+              text: segment.text,
+              isAgent,
+              isFinal: false,
+              timestamp: Date.now()
+            }];
+          });
+        }
+      });
+    };
+
+    room.on(RoomEvent.TranscriptionReceived, handleTranscription);
+
+    return () => {
+      room.off(RoomEvent.TranscriptionReceived, handleTranscription);
+    };
+  }, [room, isConnected]);
+
+  return (
+    <div className="flex flex-col h-full space-y-4">
+      <div className="text-center">
+        <span className={`text-xs px-3 py-1 rounded-full uppercase tracking-widest ${isConnected
+            ? 'text-emerald-400 bg-emerald-500/10 border border-emerald-500/20'
+            : 'text-[#3f484d] bg-[#060e20]'
+          }`}>
+          {isConnected ? '● Session Connected' : 'Connecting...'}
+        </span>
+      </div>
+
+      <div className="flex-grow overflow-y-auto px-2">
+        {!isConnected ? (
+          <div className="flex items-center justify-center h-full">
+            <div className="flex flex-col items-center gap-3">
+              <div className="flex gap-1.5">
+                <span className="w-2.5 h-2.5 bg-[#87d0f0] rounded-full animate-bounce"></span>
+                <span className="w-2.5 h-2.5 bg-[#87d0f0] rounded-full animate-bounce" style={{ animationDelay: '0.15s' }}></span>
+                <span className="w-2.5 h-2.5 bg-[#87d0f0] rounded-full animate-bounce" style={{ animationDelay: '0.3s' }}></span>
               </div>
-            )}
-            <div className="conversation-log">
-              {audioState.conversation.map((msg, i) => (
-                <div key={i} className={`message ${msg.speaker}`}>
-                  <div className="message-header">
-                    <strong>{msg.speaker === 'user' ? 'You' : 'Therapist'}</strong>
-                    {msg.confidence !== undefined && (
-                      <span className="confidence-score">Confidence: {(msg.confidence * 100).toFixed(0)}%</span>
-                    )}
-                  </div>
-                  <div className="message-content">{msg.text || <em>No text response</em>}</div>
-                  {msg.helplines && msg.helplines.length > 0 && (
-                    <div className="helpline-card" style={{ border: '2px solid #F44336', borderRadius: '8px', padding: '10px', marginTop: '10px', backgroundColor: '#ffeaea' }}>
-                      <h4 style={{ color: '#F44336', margin: '0 0 8px 0', display: 'flex', alignItems: 'center' }}>
-                        <span style={{ marginRight: '8px' }}>🆘</span> Helplines Near You
-                      </h4>
-                      <ol style={{ margin: 0, paddingLeft: '20px', color: '#B71C1C' }}>
-                        {msg.helplines.map((hl, index) => (
-                          <li key={index}><strong>{hl.name}</strong> — {hl.number}</li>
-                        ))}
-                      </ol>
-                    </div>
-                  )}
-                </div>
-              ))}
-              {audioState.isLoading && <div className="message bot">Processing...</div>}
+              <p className="text-[#bfc8cd] text-sm">Establishing secure connection...</p>
             </div>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-4">
+            {/* Transcription chat messages */}
+            {transcripts.map((msg, idx) => (
+              <div key={msg.segmentId || idx} className={`flex gap-3 items-start ${msg.isAgent ? '' : 'flex-row-reverse'}`}>
+                {msg.isAgent && (
+                  <div className="w-8 h-8 rounded-full bg-[#2d7d9a] flex items-center justify-center flex-shrink-0 mt-1 shadow-lg">
+                    <span className="material-symbols-outlined text-white text-[14px]">psychiatry</span>
+                  </div>
+                )}
+                <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed max-w-[80%] shadow-md transition-opacity ${msg.isAgent
+                    ? 'bg-[#2d3449] text-[#dae2fd] rounded-tl-none border border-white/5'
+                    : 'bg-[#87d0f0]/20 text-[#87d0f0] rounded-tr-none'
+                  } ${!msg.isFinal ? 'opacity-60 italic' : 'opacity-100'}`}>
+                  <p>{msg.text}</p>
+                </div>
+                {!msg.isAgent && (
+                  <div className="w-8 h-8 rounded-full bg-[#3f484d] flex items-center justify-center flex-shrink-0 mt-1 shadow-lg">
+                    <span className="material-symbols-outlined text-white text-[14px]">person</span>
+                  </div>
+                )}
+              </div>
+            ))}
+
+            {/* Show audio bars if no transcripts yet */}
+            {transcripts.length === 0 && (
+              <>
+                <div className="flex items-center justify-center gap-2 py-8">
+                  <div className="flex items-center gap-1">
+                    {[...Array(5)].map((_, i) => (
+                      <div key={i} className="w-1 bg-[#87d0f0] rounded-full animate-pulse"
+                        style={{
+                          height: `${12 + Math.random() * 16}px`,
+                          animationDelay: `${i * 0.15}s`,
+                          animationDuration: '0.8s'
+                        }}></div>
+                    ))}
+                  </div>
+                  <span className="text-xs text-[#87d0f0] ml-2 uppercase tracking-widest font-medium">Live Session Active</span>
+                  <div className="flex items-center gap-1">
+                    {[...Array(5)].map((_, i) => (
+                      <div key={i} className="w-1 bg-[#87d0f0] rounded-full animate-pulse"
+                        style={{
+                          height: `${12 + Math.random() * 16}px`,
+                          animationDelay: `${(i + 5) * 0.15}s`,
+                          animationDuration: '0.8s'
+                        }}></div>
+                    ))}
+                  </div>
+                </div>
+                <div className="text-center">
+                  <p className="text-[#3f484d] text-xs">Speak naturally — Serene is listening and will respond automatically.</p>
+                </div>
+              </>
+            )}
+
+            <div ref={chatEndRef} />
           </div>
         )}
       </div>
 
-      {combinedScore !== null && (
-        <div className="combined-score-display">
-          <h3>Depression Likelihood Score</h3>
-          <div className="score-bar">
-            <div className="score-fill" style={{ width: `${combinedScore * 100}%` }}>
-              {(combinedScore * 100).toFixed(1)}%
-            </div>
-          </div>
-          <p className="score-description">
-            {combinedScore < 0.3 ? 'Low likelihood of depression' :
-             combinedScore < 0.6 ? 'Moderate likelihood of depression' :
-             'High likelihood of depression'}
-          </p>
-        </div>
-      )}
+      {/* This component renders all remote audio tracks (the agent's voice) */}
+      <RoomAudioRenderer />
     </div>
   );
 }

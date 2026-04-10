@@ -2,13 +2,18 @@ import sys
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 import datetime
+
+# Load .env from the project root (one level above backend/)
+env_path = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=env_path)
 
 # Add the backend directory to Python path
 sys.path.append(str(Path(__file__).parent.parent))
 
 # Now import your routes
-from app.routes import voice_routes, video_routes
+from app.routes import voice_routes, video_routes, livekit_routes
 
 app = FastAPI(
     title="Depression Detection API",
@@ -38,6 +43,12 @@ app.include_router(
     video_routes.router,
     prefix="/api/video",
     tags=["Video Analysis"]
+)
+
+app.include_router(
+    livekit_routes.router,
+    prefix="/api/livekit",
+    tags=["LiveKit Configuration"]
 )
 
 @app.get("/", include_in_schema=False)
