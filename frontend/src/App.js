@@ -126,14 +126,18 @@ function App() {
   // LiveKit Logic
   const [lkToken, setLkToken] = useState("");
   const [livekitUrl, setLivekitUrl] = useState("");
+  const [isConnectingVoice, setIsConnectingVoice] = useState(false);
 
   const connectToVoiceAgent = async () => {
+    if (isConnectingVoice) return;
+    setIsConnectingVoice(true);
     try {
       const response = await fetch(`http://${window.location.hostname}:8000/api/livekit/token`);
       const data = await response.json();
 
       if (data.error) {
         alert("Backend Error: " + data.error);
+        setIsConnectingVoice(false);
         return;
       }
 
@@ -141,6 +145,8 @@ function App() {
       setLivekitUrl(data.url);
     } catch (err) {
       console.error("Failed to connect to AI voice agent", err);
+    } finally {
+      setIsConnectingVoice(false);
     }
   };
 
@@ -285,10 +291,13 @@ function App() {
                 </div>
 
                 <button onClick={!!lkToken ? disconnectVoiceAgent : connectToVoiceAgent}
+                  disabled={isConnectingVoice}
                   className={`flex items-center gap-2 px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider transition-all shadow-md
-                            ${!!lkToken ? 'bg-red-500/20 text-red-400 border border-red-500/50 hover:bg-red-500/30' : 'bg-[#31394d] text-[#dae2fd] border border-white/10 hover:bg-[#3f484d]'}`}>
-                  <span className="material-symbols-outlined text-[18px]">{!!lkToken ? 'stop_circle' : 'mic'}</span>
-                  {!!lkToken ? 'End Session' : 'Connect'}
+                            ${!!lkToken ? 'bg-red-500/20 text-red-400 border border-red-500/50 hover:bg-red-500/30' : 'bg-[#31394d] text-[#dae2fd] border border-white/10 hover:bg-[#3f484d] disabled:opacity-50 disabled:cursor-not-allowed'}`}>
+                  <span className="material-symbols-outlined text-[18px]">
+                    {isConnectingVoice ? 'hourglass_empty' : (!!lkToken ? 'stop_circle' : 'mic')}
+                  </span>
+                  {isConnectingVoice ? 'Connecting...' : (!!lkToken ? 'End Session' : 'Connect')}
                 </button>
               </div>
 
@@ -330,10 +339,18 @@ function ActiveVoiceSession() {
 
   const isConnected = connectionState === ConnectionState.Connected;
 
-  // Auto-scroll to bottom when new transcripts arrive
+  // Auto-scroll to bottom only if user is already near bottom (prevent scroll-locking upstream)
   useEffect(() => {
     if (chatEndRef.current) {
-      chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+      // Find the scroll container (parent)
+      const container = chatEndRef.current.parentElement;
+      if (container) {
+        const isNearBottom = container.scrollHeight - container.clientHeight - container.scrollTop < 100;
+        // If we are actively growing the transcripts from nothing, force scroll.
+        if (isNearBottom || transcripts.length <= 2) {
+          chatEndRef.current.scrollIntoView({ behavior: 'auto' }); // auto is less blocking than smooth
+        }
+      }
     }
   }, [transcripts]);
 
