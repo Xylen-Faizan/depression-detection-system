@@ -13,7 +13,7 @@ load_dotenv(dotenv_path=env_path)
 sys.path.append(str(Path(__file__).parent.parent))
 
 # Now import your routes
-from app.routes import voice_routes, video_routes, livekit_routes
+from app.routes import voice_routes, video_routes, livekit_routes, report_routes
 
 app = FastAPI(
     title="Depression Detection API",
@@ -49,6 +49,12 @@ app.include_router(
     livekit_routes.router,
     prefix="/api/livekit",
     tags=["LiveKit Configuration"]
+)
+
+app.include_router(
+    report_routes.router,
+    prefix="/api/report",
+    tags=["Report Generation"]
 )
 
 @app.get("/", include_in_schema=False)

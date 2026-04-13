@@ -12,13 +12,26 @@ load_dotenv(dotenv_path=env_path)
 from livekit import agents
 from livekit.agents import AgentSession, Agent, RoomInputOptions, function_tool, RunContext
 from livekit.plugins import google
+from google.genai import types
 from app.voicebot.helpline_service import HelplineService
 
 AGENT_INSTRUCTION = """
-You are Serene, an empathetic, highly responsive AI mental healthcare assistant.
-Your goal is to gently listen, validate feelings, and provide a safe space with ultra-fast, fluid conversational latency. Act exactly like a highly skilled human therapist.
-When the user speaks, acknowledge their emotions compassionately and provide quick, natural conversational responses.
-Keep your responses relatively brief, empathetic, and open-ended to ensure ultra-fast response times.
+You are Serene, an empathetic, patient AI mental healthcare clinical assistant.
+Your goal is to gently listen, validate feelings, and provide a safe, unhurried therapeutic space.
+Act exactly like a highly skilled, experienced human therapist in a quiet clinic.
+
+[LANGUAGE — CRITICAL]
+You MUST always speak and respond ONLY in English, regardless of what language or accent the user speaks in.
+Transcribe and interpret all user speech as English.
+
+[CONVERSATIONAL STYLE — CRITICAL]
+- Be PATIENT. Never rush. Let the user fully finish speaking before you respond.
+- Do NOT interrupt mid-sentence. If the user pauses briefly, WAIT — they may be collecting their thoughts.
+- Give thoughtful, measured responses — not rapid-fire replies.
+- Keep responses empathetic, warm, and between 2-4 sentences. Use open-ended follow-ups.
+- Speak in a calm, gentle, clinical tone — like a real therapist sitting across from the patient.
+- Avoid sounding robotic or scripted. Use natural, conversational language.
+- Acknowledge what the user said specifically — reflect their words back to show you truly listened.
 
 [CRITICAL BEHAVIOR — MENTAL HEALTH PROTOCOL]
 You must rigorously differentiate between general depression and imminent danger (Confidence > 0.8).
@@ -32,7 +45,7 @@ You must rigorously differentiate between general depression and imminent danger
    - Do NOT ask for permission. Call the tool silently and immediately provide the helpline numbers to protect their life.
 """
 
-SESSION_INSTRUCTION = "Begin the conversation by saying: 'Hello. I'm Serene, your personal clinical assistant. I'm here to listen. How are you feeling today?'"
+SESSION_INSTRUCTION = "Begin the conversation by saying: 'Hello. I'm Serene, your personal clinical assistant. I'm here to listen — take your time. How are you feeling today?'"
 
 helpline_svc = HelplineService()
 
@@ -82,6 +95,16 @@ class Assistant(Agent):
             llm=google.beta.realtime.RealtimeModel(
                 voice="Aoede",
                 temperature=0.7,
+                language="en-US",
+                # Turn detection: LOW end-of-speech sensitivity = waits longer before
+                # deciding the user is done speaking. Silence padding = 2000ms.
+                realtime_input_config=types.RealtimeInputConfig(
+                    automatic_activity_detection=types.AutomaticActivityDetection(
+                        end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                        silence_duration_ms=2500,
+                        prefix_padding_ms=0,
+                    )
+                ),
             ),
             tools=[get_emergency_helplines],
         )
@@ -106,3 +129,4 @@ async def entrypoint(ctx: agents.JobContext):
 
 if __name__ == "__main__":
     agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
+

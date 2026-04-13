@@ -9,9 +9,17 @@ import {
 import '@livekit/components-styles';
 import { ConnectionState, RoomEvent } from 'livekit-client';
 
+const API_BASE = `http://${window.location.hostname}:8000`;
+
 function App() {
   const [activeModules, setActiveModules] = useState({ video: true, audio: true });
   const [combinedScore, setCombinedScore] = useState(null);
+
+  // Voice analysis aggregated data (fed from the child ActiveVoiceSession)
+  const [voiceAnalysisData, setVoiceAnalysisData] = useState({
+    averageConfidence: 0,
+    messages: [],        // [{text, isAgent, confidence, severity, is_depressed, needs_professional_help, timestamp}]
+  });
 
   // Video analysis state
   const [videoState, setVideoState] = useState({
@@ -19,6 +27,11 @@ function App() {
   });
 
   const videoRefs = { ws: useRef(null), videoRef: useRef(null), streamRef: useRef(null), canvasRef: useRef(null), frameInterval: useRef(null) };
+
+  // Session state
+  const [sessionStartTime, setSessionStartTime] = useState(null);
+  const [showReportModal, setShowReportModal] = useState(false);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
 
   const initializeVideoSession = () => {
     try {
@@ -102,12 +115,22 @@ function App() {
     } catch (err) { }
   };
 
-  const calculateCombinedScore = () => {
-    if (videoState.emotionData.length > 0) return videoState.averageScore;
-    return null;
-  };
+  // Combined score: 0.7 × voice + 0.3 × facial  (or the available modality alone)
+  const calculateCombinedScore = useCallback(() => {
+    const hasVoice = voiceAnalysisData.messages.length > 0;
+    const hasFacial = videoState.emotionData.length > 0;
 
-  useEffect(() => { setCombinedScore(calculateCombinedScore()); }, [videoState.averageScore]);
+    if (hasVoice && hasFacial) {
+      return 0.7 * voiceAnalysisData.averageConfidence + 0.3 * videoState.averageScore;
+    } else if (hasVoice) {
+      return voiceAnalysisData.averageConfidence;
+    } else if (hasFacial) {
+      return videoState.averageScore;
+    }
+    return null;
+  }, [voiceAnalysisData.averageConfidence, voiceAnalysisData.messages.length, videoState.averageScore, videoState.emotionData.length]);
+
+  useEffect(() => { setCombinedScore(calculateCombinedScore()); }, [calculateCombinedScore]);
 
   useEffect(() => {
     return () => {
@@ -131,8 +154,9 @@ function App() {
   const connectToVoiceAgent = async () => {
     if (isConnectingVoice) return;
     setIsConnectingVoice(true);
+    setSessionStartTime(Date.now());
     try {
-      const response = await fetch(`http://${window.location.hostname}:8000/api/livekit/token`);
+      const response = await fetch(`${API_BASE}/api/livekit/token`);
       const data = await response.json();
 
       if (data.error) {
@@ -152,6 +176,100 @@ function App() {
 
   const disconnectVoiceAgent = () => {
     setLkToken("");
+    // Show the report modal if we have any data
+    if (voiceAnalysisData.messages.length > 0 || videoState.emotionData.length > 0) {
+      setShowReportModal(true);
+    }
+  };
+
+  // PDF Report Download
+  const downloadReport = async () => {
+    setIsGeneratingReport(true);
+    try {
+      const durationSeconds = sessionStartTime ? (Date.now() - sessionStartTime) / 1000 : 0;
+      const score = calculateCombinedScore() || 0;
+
+      const userMsgs = voiceAnalysisData.messages.filter(m => !m.isAgent);
+      const avgVoiceConf = userMsgs.length > 0
+        ? userMsgs.reduce((sum, m) => sum + (m.confidence || 0), 0) / userMsgs.length
+        : 0;
+
+      const payload = {
+        session_id: `SC-${Date.now().toString(36).toUpperCase()}`,
+        session_duration_seconds: durationSeconds,
+        voice_messages: voiceAnalysisData.messages.map(m => ({
+          text: m.text,
+          isAgent: m.isAgent,
+          confidence: m.confidence || null,
+          severity: m.severity || null,
+          is_depressed: m.is_depressed || false,
+          needs_professional_help: m.needs_professional_help || false,
+          timestamp: m.timestamp || null,
+        })),
+        facial_emotions: videoState.emotionData.map(e => ({
+          emotion: e.emotion,
+          score: e.score,
+          timestamp: e.timestamp || null,
+        })),
+        voice_average_confidence: avgVoiceConf,
+        facial_average_score: videoState.averageScore,
+        combined_score: score,
+      };
+
+      const res = await fetch(`${API_BASE}/api/report/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) throw new Error('Report generation failed');
+
+      const arrayBuffer = await res.arrayBuffer();
+      const blob = new Blob([arrayBuffer], { type: 'application/pdf' });
+      const fileName = `Serene_Care_Report_${new Date().toISOString().split('T')[0]}.pdf`;
+      
+      // Use msSaveBlob for Edge/IE, fallback to anchor download
+      if (window.navigator && window.navigator.msSaveOrOpenBlob) {
+        window.navigator.msSaveOrOpenBlob(blob, fileName);
+      } else {
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        // Small delay to ensure DOM attachment
+        setTimeout(() => {
+          a.click();
+          // Delay cleanup so download initiates properly
+          setTimeout(() => {
+            window.URL.revokeObjectURL(url);
+            a.remove();
+          }, 200);
+        }, 100);
+      }
+    } catch (err) {
+      console.error("Failed to download report:", err);
+      alert("Failed to generate report. Please try again.");
+    } finally {
+      setIsGeneratingReport(false);
+    }
+  };
+
+  // Confidence color helper
+  const getConfidenceColor = (confidence) => {
+    if (confidence >= 0.7) return '#F44336';
+    if (confidence >= 0.4) return '#FF9800';
+    return '#4CAF50';
+  };
+
+  const getSeverityLabel = (score) => {
+    if (score === null || score === undefined) return '';
+    if (score < 0.2) return 'Minimal';
+    if (score < 0.4) return 'Mild';
+    if (score < 0.6) return 'Moderate';
+    if (score < 0.8) return 'Moderately Severe';
+    return 'Severe';
   };
 
   return (
@@ -193,10 +311,18 @@ function App() {
                 <p className="text-xs text-[#bfc8cd] uppercase tracking-wider">Depressive Traits Likelihood</p>
                 <div className="flex items-center justify-end gap-3 mt-1">
                   <div className="w-32 h-2 bg-[#171f33] rounded-full overflow-hidden">
-                    <div className="h-full bg-[#87d0f0]" style={{ width: `${combinedScore * 100}%` }}></div>
+                    <div className="h-full transition-all duration-500" style={{
+                      width: `${combinedScore * 100}%`,
+                      backgroundColor: getConfidenceColor(combinedScore)
+                    }}></div>
                   </div>
-                  <span className="text-lg font-bold text-white">{(combinedScore * 100).toFixed(1)}%</span>
+                  <span className="text-lg font-bold" style={{ color: getConfidenceColor(combinedScore) }}>
+                    {(combinedScore * 100).toFixed(1)}%
+                  </span>
                 </div>
+                <p className="text-[10px] mt-0.5" style={{ color: getConfidenceColor(combinedScore) }}>
+                  {getSeverityLabel(combinedScore)}
+                </p>
               </div>
             )}
           </header>
@@ -290,28 +416,39 @@ function App() {
                   </div>
                 </div>
 
-                <button onClick={!!lkToken ? disconnectVoiceAgent : connectToVoiceAgent}
-                  disabled={isConnectingVoice}
-                  className={`flex items-center gap-2 px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider transition-all shadow-md
-                            ${!!lkToken ? 'bg-red-500/20 text-red-400 border border-red-500/50 hover:bg-red-500/30' : 'bg-[#31394d] text-[#dae2fd] border border-white/10 hover:bg-[#3f484d] disabled:opacity-50 disabled:cursor-not-allowed'}`}>
-                  <span className="material-symbols-outlined text-[18px]">
-                    {isConnectingVoice ? 'hourglass_empty' : (!!lkToken ? 'stop_circle' : 'mic')}
-                  </span>
-                  {isConnectingVoice ? 'Connecting...' : (!!lkToken ? 'End Session' : 'Connect')}
-                </button>
+                <div className="flex items-center gap-2">
+                  {/* Report button — only show when we have data and session is active or just ended */}
+                  {voiceAnalysisData.messages.length > 0 && (
+                    <button onClick={() => setShowReportModal(true)}
+                      className="flex items-center gap-1.5 px-3 py-2 rounded-full text-xs font-bold uppercase tracking-wider bg-[#1a2338] text-[#87d0f0] border border-[#87d0f0]/20 hover:bg-[#87d0f0]/10 transition-all"
+                      title="View session report">
+                      <span className="material-symbols-outlined text-[16px]">summarize</span>
+                    </button>
+                  )}
+
+                  <button onClick={!!lkToken ? disconnectVoiceAgent : connectToVoiceAgent}
+                    disabled={isConnectingVoice}
+                    className={`flex items-center gap-2 px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider transition-all shadow-md
+                              ${!!lkToken ? 'bg-red-500/20 text-red-400 border border-red-500/50 hover:bg-red-500/30' : 'bg-[#31394d] text-[#dae2fd] border border-white/10 hover:bg-[#3f484d] disabled:opacity-50 disabled:cursor-not-allowed'}`}>
+                    <span className="material-symbols-outlined text-[18px]">
+                      {isConnectingVoice ? 'hourglass_empty' : (!!lkToken ? 'stop_circle' : 'mic')}
+                    </span>
+                    {isConnectingVoice ? 'Connecting...' : (!!lkToken ? 'End Session' : 'Connect')}
+                  </button>
+                </div>
               </div>
 
               <div className="flex-grow overflow-y-auto p-6 space-y-6 relative">
                 {!!lkToken ? (
                   <LiveKitRoom
                     token={lkToken}
-                    serverUrl={livekitUrl} // Dynamically provided by the backend from the .env config
+                    serverUrl={livekitUrl}
                     connect={true}
                     audio={true}
                     video={false}
                     className="flex flex-col h-full"
                   >
-                    <ActiveVoiceSession />
+                    <ActiveVoiceSession onAnalysisUpdate={setVoiceAnalysisData} />
                   </LiveKitRoom>
                 ) : (
                   <div className="absolute inset-0 flex items-center justify-center flex-col text-center p-8">
@@ -326,33 +463,172 @@ function App() {
 
         </div>
       </main>
+
+      {/* ── Session Report Modal ──────────────────────────────────────────────── */}
+      {showReportModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="bg-[#131b2e] rounded-3xl border border-white/10 shadow-2xl max-w-lg w-full p-8 relative animate-[fadeIn_0.2s_ease-out]">
+            {/* Close button */}
+            <button onClick={() => setShowReportModal(false)}
+              className="absolute top-4 right-4 w-8 h-8 rounded-full bg-white/5 hover:bg-white/10 flex items-center justify-center text-[#bfc8cd] transition-colors">
+              <span className="material-symbols-outlined text-[18px]">close</span>
+            </button>
+
+            <div className="text-center mb-6">
+              <span className="material-symbols-outlined text-[48px] text-[#87d0f0] mb-3 block">monitoring</span>
+              <h2 className="text-2xl font-bold text-white mb-1">Session Complete</h2>
+              <p className="text-sm text-[#bfc8cd]">Multimodal depression screening summary</p>
+            </div>
+
+            {/* Combined Score Gauge */}
+            {combinedScore !== null && (
+              <div className="mb-6">
+                <div className="flex justify-between items-end mb-2">
+                  <span className="text-xs text-[#bfc8cd] uppercase tracking-widest">Combined Score</span>
+                  <span className="text-3xl font-bold" style={{ color: getConfidenceColor(combinedScore) }}>
+                    {(combinedScore * 100).toFixed(1)}%
+                  </span>
+                </div>
+                <div className="w-full h-3 bg-[#171f33] rounded-full overflow-hidden">
+                  <div className="h-full rounded-full transition-all duration-700"
+                    style={{
+                      width: `${combinedScore * 100}%`,
+                      background: `linear-gradient(90deg, #4CAF50, #FFC107, #F44336)`
+                    }}></div>
+                </div>
+                <p className="text-center mt-2 text-sm font-semibold" style={{ color: getConfidenceColor(combinedScore) }}>
+                  {getSeverityLabel(combinedScore)}
+                </p>
+              </div>
+            )}
+
+            {/* Stats grid */}
+            <div className="grid grid-cols-3 gap-4 mb-6">
+              <div className="bg-[#1a2338] rounded-xl p-3 text-center">
+                <p className="text-xl font-bold text-white">
+                  {voiceAnalysisData.messages.filter(m => !m.isAgent).length}
+                </p>
+                <p className="text-[10px] text-[#bfc8cd] uppercase tracking-wider">Voice Messages</p>
+              </div>
+              <div className="bg-[#1a2338] rounded-xl p-3 text-center">
+                <p className="text-xl font-bold text-white">{videoState.emotionData.length}</p>
+                <p className="text-[10px] text-[#bfc8cd] uppercase tracking-wider">Face Frames</p>
+              </div>
+              <div className="bg-[#1a2338] rounded-xl p-3 text-center">
+                <p className="text-xl font-bold text-white">
+                  {sessionStartTime ? `${((Date.now() - sessionStartTime) / 60000).toFixed(1)}m` : '—'}
+                </p>
+                <p className="text-[10px] text-[#bfc8cd] uppercase tracking-wider">Duration</p>
+              </div>
+            </div>
+
+            {/* Download button */}
+            <button onClick={downloadReport} disabled={isGeneratingReport}
+              className="w-full py-3.5 bg-gradient-to-r from-[#87d0f0] to-[#2d7d9a] text-[#003545] font-bold rounded-2xl shadow-[0_0_30px_-5px_rgba(135,208,240,0.3)] hover:scale-[1.02] active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+              <span className="material-symbols-outlined text-[20px]">
+                {isGeneratingReport ? 'hourglass_empty' : 'picture_as_pdf'}
+              </span>
+              {isGeneratingReport ? 'Generating Clinical Report...' : 'Download Clinical PDF Report'}
+            </button>
+            <p className="text-center text-[10px] text-[#3f484d] mt-3">
+              Medical-grade report for your healthcare provider
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-// Sub-component to handle the LiveKit room logic cleanly
-function ActiveVoiceSession() {
+// ══════════════════════════════════════════════════════════════════════════════
+// Sub-component: ActiveVoiceSession  —  handles LiveKit room + NLP analysis
+// ══════════════════════════════════════════════════════════════════════════════
+function ActiveVoiceSession({ onAnalysisUpdate }) {
   const connectionState = useConnectionState();
   const room = useMaybeRoomContext();
   const [transcripts, setTranscripts] = useState([]);
   const chatEndRef = useRef(null);
+  const analyzedIds = useRef(new Set()); // track which segments we've already sent for analysis
 
   const isConnected = connectionState === ConnectionState.Connected;
 
-  // Auto-scroll to bottom only if user is already near bottom (prevent scroll-locking upstream)
+  // Confidence color helper
+  const getConfidenceColor = (confidence) => {
+    if (confidence >= 0.7) return '#F44336';
+    if (confidence >= 0.4) return '#FF9800';
+    return '#4CAF50';
+  };
+
+  // Auto-scroll
   useEffect(() => {
     if (chatEndRef.current) {
-      // Find the scroll container (parent)
       const container = chatEndRef.current.parentElement;
       if (container) {
         const isNearBottom = container.scrollHeight - container.clientHeight - container.scrollTop < 100;
-        // If we are actively growing the transcripts from nothing, force scroll.
         if (isNearBottom || transcripts.length <= 2) {
-          chatEndRef.current.scrollIntoView({ behavior: 'auto' }); // auto is less blocking than smooth
+          chatEndRef.current.scrollIntoView({ behavior: 'auto' });
         }
       }
     }
   }, [transcripts]);
+
+  // ── Analyze user message via backend NLP ────────────────────────────────
+  const analyzeUserMessage = useCallback(async (segmentId, text) => {
+    if (analyzedIds.current.has(segmentId)) return;
+    analyzedIds.current.add(segmentId);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/voice/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      const data = await res.json();
+
+      if (data.status === 'success' || data.confidence !== undefined) {
+        setTranscripts(prev => {
+          const updated = prev.map(t => {
+            if (t.segmentId === segmentId) {
+              return {
+                ...t,
+                confidence: data.confidence,
+                severity: data.severity,
+                is_depressed: data.is_depressed,
+                needs_professional_help: data.needs_professional_help,
+                keywords_found: data.keywords_found,
+                analysisComplete: true,
+              };
+            }
+            return t;
+          });
+          return updated;
+        });
+      }
+    } catch (err) {
+      console.error('NLP analysis failed for segment:', segmentId, err);
+    }
+  }, []);
+
+  // ── Propagate analysis data up to parent ──────────────────────────────
+  useEffect(() => {
+    const analyzed = transcripts.filter(t => !t.isAgent && t.analysisComplete);
+    const avgConf = analyzed.length > 0
+      ? analyzed.reduce((sum, t) => sum + (t.confidence || 0), 0) / analyzed.length
+      : 0;
+
+    onAnalysisUpdate({
+      averageConfidence: avgConf,
+      messages: transcripts.map(t => ({
+        text: t.text,
+        isAgent: t.isAgent,
+        confidence: t.confidence || null,
+        severity: t.severity || null,
+        is_depressed: t.is_depressed || false,
+        needs_professional_help: t.needs_professional_help || false,
+        timestamp: t.timestamp,
+      })),
+    });
+  }, [transcripts, onAnalysisUpdate]);
 
   // Listen for transcription events from the room
   useEffect(() => {
@@ -369,7 +645,6 @@ function ActiveVoiceSession() {
         if (!segment.text || segment.text.trim() === '') return;
 
         if (segment.final) {
-          // Final segment - add or update the transcript
           setTranscripts(prev => {
             const existingIdx = prev.findIndex(t => t.segmentId === segment.id);
             if (existingIdx >= 0) {
@@ -389,8 +664,12 @@ function ActiveVoiceSession() {
               timestamp: Date.now()
             }];
           });
+
+          // Trigger NLP analysis for user messages only
+          if (!isAgent) {
+            analyzeUserMessage(segment.id, segment.text);
+          }
         } else {
-          // Interim segment - update or add
           setTranscripts(prev => {
             const existingIdx = prev.findIndex(t => t.segmentId === segment.id);
             if (existingIdx >= 0) {
@@ -418,7 +697,7 @@ function ActiveVoiceSession() {
     return () => {
       room.off(RoomEvent.TranscriptionReceived, handleTranscription);
     };
-  }, [room, isConnected]);
+  }, [room, isConnected, analyzeUserMessage]);
 
   return (
     <div className="flex flex-col h-full space-y-4">
@@ -453,11 +732,49 @@ function ActiveVoiceSession() {
                     <span className="material-symbols-outlined text-white text-[14px]">psychiatry</span>
                   </div>
                 )}
-                <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed max-w-[80%] shadow-md transition-opacity ${msg.isAgent
-                    ? 'bg-[#2d3449] text-[#dae2fd] rounded-tl-none border border-white/5'
-                    : 'bg-[#87d0f0]/20 text-[#87d0f0] rounded-tr-none'
-                  } ${!msg.isFinal ? 'opacity-60 italic' : 'opacity-100'}`}>
-                  <p>{msg.text}</p>
+                <div className="flex flex-col max-w-[80%]">
+                  <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-md transition-opacity ${msg.isAgent
+                      ? 'bg-[#2d3449] text-[#dae2fd] rounded-tl-none border border-white/5'
+                      : 'bg-[#87d0f0]/20 text-[#87d0f0] rounded-tr-none'
+                    } ${!msg.isFinal ? 'opacity-60 italic' : 'opacity-100'}`}>
+                    <p>{msg.text}</p>
+                  </div>
+
+                  {/* ── Confidence badge for user messages ────────────── */}
+                  {!msg.isAgent && msg.isFinal && (
+                    <div className="flex items-center gap-2 mt-1.5 justify-end">
+                      {msg.analysisComplete ? (
+                        <>
+                          <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider"
+                            style={{
+                              backgroundColor: `${getConfidenceColor(msg.confidence)}15`,
+                              color: getConfidenceColor(msg.confidence),
+                              border: `1px solid ${getConfidenceColor(msg.confidence)}30`,
+                            }}>
+                            <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: getConfidenceColor(msg.confidence) }}></span>
+                            {(msg.confidence * 100).toFixed(0)}% conf
+                          </div>
+                          {msg.severity && msg.severity !== 'mild' && (
+                            <span className="text-[10px] px-2 py-0.5 rounded-full font-semibold uppercase tracking-wider"
+                              style={{
+                                backgroundColor: msg.severity === 'severe' ? '#F4433615' : '#FF980015',
+                                color: msg.severity === 'severe' ? '#F44336' : '#FF9800',
+                                border: `1px solid ${msg.severity === 'severe' ? '#F4433630' : '#FF980030'}`,
+                              }}>
+                              {msg.severity}
+                            </span>
+                          )}
+                          {msg.needs_professional_help && (
+                            <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-500/10 text-red-400 border border-red-500/20 font-bold uppercase tracking-wider">
+                              ⚠ Help
+                            </span>
+                          )}
+                        </>
+                      ) : (
+                        <span className="text-[10px] text-[#3f484d] italic">analyzing...</span>
+                      )}
+                    </div>
+                  )}
                 </div>
                 {!msg.isAgent && (
                   <div className="w-8 h-8 rounded-full bg-[#3f484d] flex items-center justify-center flex-shrink-0 mt-1 shadow-lg">

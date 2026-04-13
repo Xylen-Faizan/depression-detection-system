@@ -17,3 +17,4 @@ livekit-plugins-google
 livekit-plugins-noise-cancellation
 livekit-plugins-silero
 requests
+reportlab
